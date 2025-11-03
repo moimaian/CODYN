@@ -1,17 +1,21 @@
-# splash_screen.py
+# splash_screen.py (com logs e chaves compatíveis com CODYN.py)
 import os
-import subprocess
 import sys
 import shutil
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QMessageBox
+from pathlib import Path
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPixmap, QGuiApplication
-import webbrowser
+
+
+def _print(msg: str):
+    print(msg, flush=True)
+
 
 class SplashScreen(QWidget):
     check_complete = pyqtSignal(dict)  # Emite dicionário de status
 
-    def __init__(self, codyn_dir):
+    def __init__(self, codyn_dir: str):
         super().__init__()
         self.codyn_dir = codyn_dir
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -22,11 +26,11 @@ class SplashScreen(QWidget):
         size = screen.availableGeometry()
         width, height = 400, 350
         self.resize(width, height)
-        self.move((size.width()-width)//2, (size.height()-height)//2)
+        self.move((size.width() - width) // 2, (size.height() - height) // 2)
 
         # Layout principal
-        layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
+        layout_ss = QVBoxLayout()
+        layout_ss.setAlignment(Qt.AlignCenter)
 
         # Logo
         logo = QLabel()
@@ -37,111 +41,130 @@ class SplashScreen(QWidget):
         else:
             logo.setText("LOGO NOT FOUND")
         logo.setAlignment(Qt.AlignCenter)
-        layout.addWidget(logo)
+        layout_ss.addWidget(logo)
 
         # Texto
         label = QLabel("Loading CODYN...")
         label.setAlignment(Qt.AlignCenter)
         label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #333333;")
-        layout.addWidget(label)
+        layout_ss.addWidget(label)
 
         # Barra de progresso
         self.progress = QProgressBar()
         self.progress.setAlignment(Qt.AlignCenter)
         self.progress.setFixedHeight(24)
-        self.progress.setStyleSheet("QProgressBar { font-size: 10pt; border-radius: 4px; font-weight: bold; color: #333333; }")
-        layout.addWidget(self.progress)
+        self.progress.setStyleSheet(
+            "QProgressBar { font-size: 10pt; border-radius: 4px; font-weight: bold; color: #333333; }"
+        )
+        layout_ss.addWidget(self.progress)
 
-        self.setLayout(layout)
+        self.setLayout(layout_ss)
 
         self.status = {}
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_progress)
+        self.timer.timeout.connect(self._update_progress)
         self.current = 0
 
     def start_checks(self):
+        """Inicia checagens e mostra progresso."""
         self.progress.setValue(0)
         self.current = 0
-        self.status = {
-            'folders_ok': True,
-            'missing_folders': [],
-            'env_cmds': {},
-        }
-        self.timer.start(30)  # ~5 segundos com 100 steps (100*30ms=3s)
-        QTimer.singleShot(200, self.run_checks)
 
-    def update_progress(self):
+        # Estrutura de status compatível com CODYN.py
+        self.status = {
+            # Compatibilidade (o CODYN.py usa essas três chaves):
+            "folders_ok": True,
+            "missing_folders": [],
+            "env_cmds": {},   # dict[str, bool] — True se encontrado, False se ausente
+
+            # Extras informativos (não usados por CODYN.py, mas úteis no debug):
+            "folders": {},        # nome -> caminho
+            "venv": {},           # dir/python paths
+            "tools_paths": {},    # nome -> caminho (ou None)
+        }
+
+        self.timer.start(30)
+        QTimer.singleShot(150, self._run_checks)
+
+    def _update_progress(self):
         self.current += 1
         self.progress.setValue(self.current)
         if self.current >= 100:
             self.timer.stop()
             self.check_complete.emit(self.status)
 
-    def run_checks(self):
-        
+    # ------------------ checagens ------------------
 
-        # Garante o atalho .desktop dinâmico
-        home = os.path.expanduser("~")
-        desktop_dir = os.path.join(home, ".local", "share", "applications")
-        os.makedirs(desktop_dir, exist_ok=True)
-        desktop_file = os.path.join(desktop_dir, "CODYN.desktop")
+    def _check_folder(self, name: str, path: Path):
+        exists = path.exists() and path.is_dir()
+        self.status["folders"][name] = str(path)
+        if not exists:
+            self.status["folders_ok"] = False
+            self.status["missing_folders"].append(str(path))
+        _print(f"[CODYN][CHECK] DIR {name:>8}: {path}  ->  {'OK' if exists else 'MISSING'}")
+        return exists
 
-        # Descobre o caminho do python atual
-        python_exec = sys.executable
-        # Exemplo: /home/usuario/miniconda3/envs/MEUENV/bin/python
+    def _check_folders(self):
+        root = Path(self.codyn_dir)
+        pairs = [
+            ("BASE",    root / "BASE"),
+            ("BIN",     root / "BIN"),
+            ("RUNS",    root / "RUNS"),
+            ("TARGET",  root / "TARGET"),
+            ("LIGANDS", root / "LIGANDS"),
+            ("ICONS",   root / "ICONS"),
+            ("TEST",    root / "TEST"),
+        ]
+        _print("[CODYN] ===== Verificando diretórios importantes =====")
+        for name, path in pairs:
+            self._check_folder(name, path)
 
-        # Descobre se está rodando dentro de um ambiente conda
-        conda_prefix = os.environ.get("CONDA_PREFIX", "")
-        conda_env_name = os.environ.get("CONDA_DEFAULT_ENV", "")
-        if shutil.which("conda"):
-            # Sugestão: lista os envs, poderia ser extendido para deixar o usuário escolher
-            conda_info = os.popen("conda env list").read()
-            print("[INFO] Conda env list:\n", conda_info)
-
-        codyn_py_path = os.path.join(home, "CODYN", "CODYN.py")
-        icon_path = os.path.join(home, "CODYN", "ICONS", "LOGO_CODYN.png")
-
-        # Modo interativo e com o python correto
-        desktop_content = f"""[Desktop Entry]
-Version=2025.1
-Name=CODYN
-Comment=AUTOMATIZED MOLECULAR DYNAMICS TOOL
-Exec=bash -i -c "{python_exec} {codyn_py_path}"
-Icon={icon_path}
-Terminal=false
-Type=Application
-Categories=Qt;Science;Chemistry;Physics;Education;
-StartupNotify=false
-MimeType=chemical/x-cml;chemical/x-xyz;
-"""
-        if os.path.exists(desktop_file):
-            print(f"[INFO] O atalho já existe em: {desktop_file}")
+    def _check_venv(self):
+        venv_dir = Path.home() / ".venv" / "CODYN"
+        if os.name == "nt":
+            vpy = venv_dir / "Scripts" / "python.exe"
         else:
-            with open(desktop_file, "w") as f:
-                f.write(desktop_content)
-            os.chmod(desktop_file, 0o755)
-            print(f"[OK] Arquivo .desktop criado em: {desktop_file}")      
-        
-        # Cria pastas se necessário
-        folders_to_create = ["LIGANDS", "TARGET", "RUNS"]
-        for folder in folders_to_create:
-            path = os.path.join(self.codyn_dir, folder)
-            if not os.path.exists(path):
-                os.makedirs(path)
+            vpy = venv_dir / "bin" / "python"
 
-        # Checa pastas obrigatórias
-        must_exist = ["BASE", "BIN", "ICONS"]
-        missing = []
-        for folder in must_exist:
-            path = os.path.join(self.codyn_dir, folder)
-            if not os.path.exists(path):
-                missing.append(folder)
-        self.status['folders_ok'] = (len(missing) == 0)
-        self.status['missing_folders'] = missing
+        exists_dir = venv_dir.exists()
+        exists_py = vpy.exists()
 
-        # Checa comandos no PATH
-        required_cmds = ['gmx_MMPBSA', 'gmx', 'obabel']
-        for cmd in required_cmds:
-            result = subprocess.call(f"command -v {cmd}", shell=True,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.status['env_cmds'][cmd] = (result == 0)
+        self.status["venv"]["dir"] = str(venv_dir)
+        self.status["venv"]["python"] = str(vpy) if exists_py else None
+
+        _print("\n[CODYN] ===== Verificando ambiente ~/.venv/CODYN =====")
+        _print(f"[CODYN][CHECK] VENV DIR : {venv_dir}  ->  {'OK' if exists_dir else 'MISSING'}")
+        _print(f"[CODYN][CHECK] VENV PY  : {vpy}  ->  {'OK' if exists_py else 'MISSING'}")
+
+    def _which(self, name: str) -> str | None:
+        return shutil.which(name)
+
+    def _check_tools(self):
+        _print("\n[CODYN] ===== Verificando programas externos =====")
+
+        # GROMACS (gmx)
+        gmx_path = self._which("gmx")
+        if not gmx_path and Path("/usr/local/gromacs/bin/gmx").exists():
+            gmx_path = "/usr/local/gromacs/bin/gmx"
+        self.status["tools_paths"]["gmx"] = gmx_path
+        self.status["env_cmds"]["gmx"] = bool(gmx_path)
+        _print(f"[CODYN][CHECK] GROMACS (gmx): {gmx_path if gmx_path else 'NOT FOUND'}  ->  {'OK' if gmx_path else 'MISSING'}")
+
+        # gmx_MMPBSA: vale tanto binário quanto módulo Python
+        mmpbsa_path = self._which("gmx_MMPBSA")
+        if not mmpbsa_path:
+            try:
+                import importlib.util
+                spec = importlib.util.find_spec("gmx_MMPBSA")
+                if spec and getattr(spec, 'origin', None):
+                    mmpbsa_path = f"module:{spec.origin}"
+            except Exception:
+                pass
+        self.status["tools_paths"]["gmx_MMPBSA"] = mmpbsa_path
+        self.status["env_cmds"]["gmx_MMPBSA"] = bool(mmpbsa_path)
+        _print(f"[CODYN][CHECK] gmx_MMPBSA  : {mmpbsa_path if mmpbsa_path else 'NOT FOUND'}  ->  {'OK' if mmpbsa_path else 'MISSING'}")
+
+    def _run_checks(self):
+        self._check_folders()
+        self._check_venv()
+        self._check_tools()
