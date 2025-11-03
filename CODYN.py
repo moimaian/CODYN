@@ -1,3 +1,238 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ========================= BOOTSTRAP CODYN (pip-only) =========================
+# venv global por usuário: $HOME/.venv/CODYN
+# - Se não existir, cria e reexecuta dentro dele.
+# - Garante PyQt5 (fixo) p/ exibir UI.
+# - Verifica demais pacotes/versões (fixas) e FERRAMENTAS EXTERNAS (CUDA, GROMACS, gmx_MMPBSA);
+#   se faltar algo, abre o Install Requirements.
+
+import os, sys, subprocess, importlib.util, shutil
+from pathlib import Path
+from typing import Optional
+
+os.environ.setdefault("PYTHONNOUSERSITE", "1")
+
+# Versões EXATAS (Python packages)
+PINNED = {
+    "numpy": "1.26.4",
+    "pandas": "2.1.4",
+    "matplotlib": "3.8.4",
+    "scipy": "1.13.1",
+    "psutil": "5.9.8",
+    "rdkit": "2022.09.5",
+    "PyQt5": "5.15.10",  # PyQt5 é a única instalada automaticamente aqui
+}
+
+ROOT = Path(__file__).resolve().parent
+BIN_DIR = ROOT / "BIN"
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(BIN_DIR))
+
+
+# ---- helpers gerais ----
+def _which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+def _venv_paths():
+    venv_dir = Path.home() / ".venv" / "CODYN"
+    if os.name == "nt":
+        py = venv_dir / "Scripts" / "python.exe"
+        pip = venv_dir / "Scripts" / "pip.exe"
+    else:
+        py = venv_dir / "bin" / "python"
+        pip = venv_dir / "bin" / "pip"
+    return venv_dir, py, pip
+
+def _run(cmd):
+    return subprocess.run(cmd, check=True, text=True)
+
+def _ensure_venv():
+    venv_dir, vpy, vpip = _venv_paths()
+    if not vpy.exists():
+        venv_dir.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[CODYN] Criando venv em {venv_dir} ...")
+        _run([sys.executable, "-m", "venv", str(venv_dir)])
+        _run([str(vpy), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    return venv_dir, vpy, vpip
+
+def _ensure_pyqt5(vpy, vpip):
+    try:
+        import PyQt5  # noqa
+        import PyQt5.QtWidgets  # noqa
+        # Força a versão exata se estiver diferente
+        from PyQt5 import QtCore
+        ver = getattr(QtCore, "__version__", None)
+        if ver and ver != PINNED["PyQt5"]:
+            print(f"[CODYN] PyQt5 versão {ver} != {PINNED['PyQt5']}. Ajustando...")
+            _run([str(vpip), "install", f"PyQt5=={PINNED['PyQt5']}"])
+    except Exception:
+        print("[CODYN] Instalando PyQt5 (necessário para abrir a interface)...")
+        _run([str(vpip), "install", f"PyQt5=={PINNED['PyQt5']}"])
+
+def _reexec_in_venv(vpy):
+    if Path(sys.executable).resolve() != Path(vpy).resolve():
+        print(f"[CODYN] Reexecutando dentro do venv: {vpy}")
+        env = os.environ.copy()
+        env["CODYN_BOOTSTRAPPED"] = "1"
+        os.execve(str(vpy), [str(vpy), __file__], env)
+
+# ---- checagem de pacotes Python pinados ----
+def _missing_or_mismatched_packages():
+    missing = []
+    mismatched = []
+    for mod, ver in PINNED.items():
+        if mod == "PyQt5":
+            continue  # já tratado separadamente
+        try:
+            pkg = __import__(mod)
+            cur = getattr(pkg, "__version__", None)
+            if cur is None or cur != ver:
+                mismatched.append((mod, ver, cur))
+        except Exception:
+            missing.append((mod, ver))
+    return missing, mismatched
+
+# ---- checagem de ferramentas externas ----
+def _external_tools_status():
+    """
+    Retorna (missing, details) para:
+      - CUDA Toolkit: precisa de 'nvcc'
+      - GROMACS: precisa de 'gmx'
+      - gmx_MMPBSA: import do módulo Python 'gmx_MMPBSA' OU binário 'gmx_MMPBSA'
+    """
+    missing = []
+    details = []
+
+    # CUDA Toolkit
+    nvcc = _which("nvcc")
+    if not nvcc:
+        missing.append("CUDA Toolkit")
+        details.append(" - CUDA Toolkit: 'nvcc' não encontrado no PATH")
+    else:
+        details.append(f" - CUDA Toolkit: OK ({nvcc})")
+
+    # GROMACS
+    gmx = _which("gmx")
+    if not gmx:
+        # tentar um caminho comum quando instalado via make install
+        if Path("/usr/local/gromacs/bin/gmx").exists():
+            details.append(" - GROMACS: OK (/usr/local/gromacs/bin/gmx)")
+        else:
+            missing.append("GROMACS")
+            details.append(" - GROMACS: 'gmx' não encontrado no PATH")
+    else:
+        details.append(f" - GROMACS: OK ({gmx})")
+
+    # gmx_MMPBSA
+    mmpbsa_bin = _which("gmx_MMPBSA")
+    mmpbsa_mod = importlib.util.find_spec("gmx_MMPBSA")
+    if not (mmpbsa_bin or mmpbsa_mod):
+        missing.append("gmx_MMPBSA")
+        details.append(" - gmx_MMPBSA: nem módulo Python ('gmx_MMPBSA') nem binário 'gmx_MMPBSA' encontrado")
+    else:
+        where = mmpbsa_bin or ("module:" + str(mmpbsa_mod.origin) if mmpbsa_mod and mmpbsa_mod.origin else "module")
+        details.append(f" - gmx_MMPBSA: OK ({where})")
+
+    return missing, details
+
+def _maybe_open_requirements_ui(message: str):
+    # Garante um QApplication e abre a UI do instalador
+    try:
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+    except Exception as e:
+        print("[CODYN] Falha ao importar PyQt5 para exibir UI:", e)
+        sys.exit(1)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    reply = QMessageBox.information(None, "Requisitos do CODYN", message, QMessageBox.Ok)
+
+    try:
+        from module_requirements import RequirementsInstaller  # BIN/module_requirements.py
+        w = RequirementsInstaller()
+        w.show()
+        app.exec_()
+    except Exception as e:
+        QMessageBox.critical(None, "Erro",
+            f"Não foi possível abrir o instalador de requisitos:\n{e}\n\n"
+            f"Verifique o arquivo BIN/module_requirements.py.")
+        sys.exit(1)
+
+def _bootstrap():
+    # 1) Criar/entrar no venv
+    if os.environ.get("CODYN_BOOTSTRAPPED") != "1":
+        venv_dir, vpy, vpip = _ensure_venv()
+        _reexec_in_venv(vpy)
+
+    # 2) Já dentro do venv
+    venv_dir, vpy, vpip = _venv_paths()
+    _ensure_pyqt5(vpy, vpip)
+
+    # 3) Checar pacotes Python pinados
+    missing_py, mismatched_py = _missing_or_mismatched_packages()
+
+    # 4) Checar ferramentas externas
+    missing_ext, ext_details = _external_tools_status()
+
+    if missing_py or mismatched_py or missing_ext:
+        msg_lines = []
+
+        if missing_py:
+            msg_lines.append("Pacotes Python ausentes:")
+            for m, v in missing_py:
+                msg_lines.append(f"  - {m}=={v}")
+
+        if mismatched_py:
+            msg_lines.append("\nPacotes Python com versão diferente da requerida:")
+            for m, want, cur in mismatched_py:
+                msg_lines.append(f"  - {m}: instalado={cur!r}, requerido={want}")
+
+        if missing_ext:
+            msg_lines.append("\nFerramentas externas ausentes:")
+            for name in missing_ext:
+                msg_lines.append(f"  - {name}")
+
+        # Detalhes de diagnóstico das externas
+        if ext_details:
+            msg_lines.append("\nDiagnóstico de ferramentas externas:")
+            msg_lines.extend(ext_details)
+
+        msg_lines.append("\nClique em OK para abrir o instalador de requisitos.")
+        _maybe_open_requirements_ui("\n".join(msg_lines))
+
+        # Revalida após a janela do instalador
+        missing_py2, mismatched_py2 = _missing_or_mismatched_packages()
+        missing_ext2, ext_details2 = _external_tools_status()
+
+        if missing_py2 or mismatched_py2 or missing_ext2:
+            from PyQt5.QtWidgets import QMessageBox, QApplication
+            app = QApplication.instance() or QApplication(sys.argv)
+            final_lines = ["Alguns requisitos ainda não estão atendidos. Tente novamente em 'Install Requirements'.\n"]
+
+            if missing_py2:
+                final_lines.append("Ainda faltam pacotes Python:")
+                for m, v in missing_py2:
+                    final_lines.append(f"  - {m}=={v}")
+            if mismatched_py2:
+                final_lines.append("\nPacotes Python com versão divergente:")
+                for m, want, cur in mismatched_py2:
+                    final_lines.append(f"  - {m}: instalado={cur!r}, requerido={want}")
+            if missing_ext2:
+                final_lines.append("\nAinda faltam ferramentas externas:")
+                for name in missing_ext2:
+                    final_lines.append(f"  - {name}")
+            if ext_details2:
+                final_lines.append("\nDiagnóstico atual das ferramentas externas:")
+                final_lines.extend(ext_details2)
+
+            QMessageBox.warning(None, "CODYN", "\n".join(final_lines))
+            sys.exit(1)
+
+_bootstrap()
+# ======================= FIM DO BOOTSTRAP CODYN ==============================
+
+
 # IMPORTANDO AS BIBLIOTECAS PARA CODYN.py:
 import sys
 import os
@@ -280,10 +515,9 @@ class MMPBSAWorker(QThread):
             self.log_mmpbsa_signal.emit(f"Time production values in runs folders: {self.t_ns_md_list}")
             if not self.t_ns_md_list:
                 self.t_ns_md = None
-                # busca como no seu código
                 for run_folder in self.run_folders:
                     for fname in os.listdir(run_folder):
-                        match = re.match(r"md_0_(\d+)\.tpr", fname)
+                        match = re.search(r"md_0_([\d\.]+)\.xtc", fname)
                         if match:
                             self.t_ns_md = match.group(1)
                             break
@@ -708,21 +942,35 @@ QPushButton:pressed {
         self.status_prod = status_prod
         main_layout.addWidget(status_prod)
 
+        # Duas colunas de opções
+        col_layout = QHBoxLayout()
+
         # Barra de progresso para Steps
         self.progress_step = QProgressBar()
         self.progress_step.setFormat("Step: %v")
+        self.progress_step.setStyleSheet("font-size:10pt;font-weight:bold;")
         self.progress_step.setMinimum(0)
         self.progress_step.setMaximum(1)
         self.progress_step.setValue(0)
-        main_layout.addWidget(self.progress_step)
+        col_layout.addWidget(self.progress_step)
+
+        # ---- Coluna Direita ----
+        right_col = QVBoxLayout()
 
         # Barra de progresso para tempo restante
         self.progress_time = QProgressBar()
         self.progress_time.setFormat("Remaining Time:  --:--:-- ")
+        self.progress_time.setStyleSheet("font-size:10pt;font-weight:bold;")
         self.progress_time.setMinimum(0)
-        self.progress_time.setMaximum(10)
+        # self.progress_time.setMaximum(60)
         self.progress_time.setValue(0)
-        main_layout.addWidget(self.progress_time)
+
+        col_layout.addWidget(self.progress_time)
+
+        # Definindo os fatores de expansão
+        col_layout.setStretch(0, 3)  # self.progress_step ocupa 3 partes
+        col_layout.setStretch(1, 1)  # self.progress_time 
+        main_layout.addLayout(col_layout)
 
         # Botão Cancelar
         btn_cancel = QPushButton("CANCEL")
@@ -870,7 +1118,6 @@ QPushButton:pressed {
 """)
         run_btn_single.clicked.connect(self.salvar_mmpbsa_single)
         button_layout.addWidget(run_btn_single, alignment=Qt.AlignCenter)
-        main_layout.addLayout(button_layout)
 
         # Botão RUN centralizado
         run_btn_all = QPushButton("RUN ALL")
@@ -1205,7 +1452,7 @@ QPushButton:pressed {
         self.req_win.show()
         self.req_win.activateWindow()
         self.req_win.raise_()
-        
+    
     def update_progress_time(self, secs: int):
         if secs is None or secs < 0:
             # fallback para casos estranhos
@@ -1256,7 +1503,7 @@ QPushButton:pressed {
             xtc_files = [f for f in os.listdir(run_folder) if f.startswith("md_0_") and f.endswith(".xtc")]
             if xtc_files:
                 # Extrai o número entre md_0_ e .xtc
-                match = re.search(r"md_0_([\d\.]+)\.xtc", xtc_files[0])
+                match = re.search(r"md_0_(\d+)\.xtc", xtc_files[0])
                 if match:
                     t_ns_md = match.group(1)
                     t_ns_md_list.append(t_ns_md)
@@ -1358,7 +1605,7 @@ idecomp={config_mmpbsa['idecomp']}, dec_verbose={config_mmpbsa['dec_verbose']},
             xtc_files = [f for f in os.listdir(run_folder) if f.startswith("md_0_") and f.endswith(".xtc")]
             if xtc_files:
                 # Extrai o número entre md_0_ e .xtc
-                match = re.search(r"md_0_([\d\.]+)\.xtc", xtc_files[0])
+                match = re.search(r"md_0_(\d+)\.xtc", xtc_files[0])
                 if match:
                     t_ns_md = match.group(1)
                     t_ns_md_list.append(t_ns_md)
@@ -1537,9 +1784,9 @@ if __name__ == "__main__":
             missing = ', '.join(status['missing_folders'])
             QMessageBox.warning(
                 None,
-                "Pastas necessárias ausentes",
-                f"As seguintes pastas obrigatórias não foram encontradas: {missing}\n"
-                f"Faça o download da estrutura completa do projeto no GitHub."
+                "Missing required folders",
+                f"The following mandatory folders were not found: {missing}\n"
+                f"Please download the complete project structure from GitHub."
             )
             webbrowser.open("https://github.com/moimaian/CODYN")
 
@@ -1551,10 +1798,10 @@ if __name__ == "__main__":
         if missing_tools:
             QMessageBox.critical(
                 window,
-                "Dependências não instaladas",
-                "Os seguintes comandos não estão disponíveis no PATH:\n"
+                "Dependencies not installed",
+                "The following commands are not available in the PATH:\n"
                 + "\n".join(missing_tools) +
-                "\n\nPor favor, instale os requisitos. (Ou utilize o botão na Home para instalar depois.)"
+                "\n\nPlease install the requirements. (Or use the button on the Home tab to install later.)"
             )
     splash.check_complete.connect(start_mainwindow)
     sys.exit(app.exec_())
