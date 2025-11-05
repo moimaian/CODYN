@@ -34,9 +34,7 @@ Use the following command if you do not have python3 on your system:
 >$ sudo apt update
 >$ sudo apt install python3 -y
 A window will then appear describing the requirements that are not installed in the environment so that the user knows what needs to be installed beforehand. This installation can be done through the interface itself, which will open automatically with the install_requirements.py module window.
-In this first execution, the virtual Python environment will be created in 
-$HOME/.venv/CODYN
-where the program packages that are prerequisites for running CODYN will be installed (see PREREQUISITES).
+In this first execution, the virtual Python environment will be created where the program packages that are prerequisites for running CODYN will be installed (see PREREQUISITES).
 For installations via the terminal, this environment can be activated with the command:
 >$ source $HOME/.venv/CODYN/bin/activate
 
@@ -77,6 +75,6 @@ Results: In this final tab, you can choose from several previous runs to display
 
 ATTENTION! For further information on use, please consult the user_manual.pdf provided.
 
-##########################################################################################################
+####################################################################################
 Ready! Enjoy! I hope it is useful in your work!
 
