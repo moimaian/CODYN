@@ -101,7 +101,7 @@ class RequirementsInstaller(QWidget):
       - Stack Python (versões escolhidas, via pip dentro do venv)
       - CUDA Toolkit (sistema, via apt)
       - GROMACS 2024.5 com CUDA (build a partir do source, via cmake)
-      - Open Babel (pip openbabel-wheel; fallback apt openbabel)
+      - Open Babel (pip openbabel>=3.2.0; fallback apt openbabel)
       - gmx_MMPBSA (pip + deps sistema openmpi; clone e pip install .)
       - Atalho (.desktop): apenas um checkbox para criar/atualizar o lançador padrão
     """
@@ -513,13 +513,13 @@ class RequirementsInstaller(QWidget):
     def install_openbabel(self, pybin: str) -> bool:
         """
         Instala Open Babel:
-          1) tenta 'pip install openbabel-wheel' (wheels pré-compilados)
+          1) tenta 'pip install openbabel>=3.2.0' (wheels pré-compilados)
           2) fallback: 'sudo apt install openbabel'
         """
-        self.log_signal.emit("Trying pip install 'openbabel-wheel'...\n")
-        res = _pip_install(pybin, ["openbabel-wheel"])
+        self.log_signal.emit("Trying pip install 'openbabel>=3.2.0'...\n")
+        res = _pip_install(pybin, ["openbabel>=3.2.0"])
         if res.returncode == 0:
-            self.log_signal.emit("OpenBabel installed via pip (openbabel-wheel).\n")
+            self.log_signal.emit("OpenBabel installed via pip (openbabel>=3.2.0).\n")
             return True
 
         self.log_signal.emit("pip wheel not available for this platform. Trying apt (requires sudo)...\n")
