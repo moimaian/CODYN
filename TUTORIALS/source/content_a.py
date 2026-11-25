@@ -53,12 +53,51 @@ def build_a(m, V):
     m.code("sudo apt update\nsudo apt install python3 python3-venv python3-pip -y")
     m.h2(("Primeira execução e ambiente virtual", "First run and virtual environment"))
     m.p(("Na primeira execução o CODYN cria automaticamente um ambiente virtual Python em `$HOME/.venv/CODYN`, instala o PyQt5 (o suficiente para a "
-         "interface abrir) e reinicia a si mesmo dentro desse ambiente. Esse passo precisa de um terminal — o lançador do menu abre um automaticamente. "
+         "interface abrir) e reinicia a si mesmo dentro desse ambiente. Esse passo precisa de um terminal — o lançador do menu abre um automaticamente (no Windows, use o `CODYN_Windows.bat`, descrito abaixo). "
          "Todo o restante é instalado pela janela **Instalar requisitos**. Para instalar pacotes manualmente, ative o ambiente com:",
          "On the first run CODYN automatically creates a Python virtual environment at `$HOME/.venv/CODYN`, installs PyQt5 (just enough for the interface to open) "
-         "and restarts itself inside that environment. This step needs a terminal — the menu launcher opens one automatically. "
+         "and restarts itself inside that environment. This step needs a terminal — the menu launcher opens one automatically (on Windows, use `CODYN_Windows.bat`, described below). "
          "Everything else is installed from the **Install requirements** window. To install packages manually, activate the environment with:"), keep_next=True)
     m.code("source $HOME/.venv/CODYN/bin/activate")
+
+    m.h2(("Instalação no Windows 10/11", "Installation on Windows 10/11"))
+    m.p(("No Windows o CODYN roda a partir do código-fonte, em um ambiente Python **3.10.11**. Baixe o repositório como arquivo zip, extraia-o em qualquer pasta "
+         "(por exemplo, `C:\\Users\\<usuário>\\CODYN`) e dê um **duplo clique em CODYN_Windows.bat** — não é preciso abrir o PowerShell nem digitar comandos. "
+         "Se o Windows exibir \"O Windows protegeu o computador\", clique em *Mais informações* > *Executar assim mesmo*.",
+         "On Windows CODYN runs from the source code, in a Python **3.10.11** environment. Download the repository as a zip file, extract it to any folder "
+         "(for example `C:\\Users\\<user>\\CODYN`) and **double-click CODYN_Windows.bat** — there is no need to open PowerShell or type commands. "
+         "If Windows shows \"Windows protected your PC\", click *More info* > *Run anyway*."), keep_next=True)
+    m.p(("O script, **somente na primeira execução**:", "The script, **on the first run only**:"), keep_next=True)
+    m.numbered([
+        ("procura o Python 3.10 ou superior; se não encontrar, baixa o instalador oficial do **Python 3.10.11** em python.org, confere a assinatura digital e o instala apenas para o usuário atual (sem privilégios de administrador);",
+         "looks for Python 3.10 or later; if none is found, it downloads the official **Python 3.10.11** installer from python.org, checks its digital signature and installs it for the current user only (no administrator rights);"),
+        ("executa `CODYN.py` já respondendo \"sim\" às perguntas de preparação (variável `CODYN_ASSUME_YES=1`);",
+         "runs `CODYN.py` already answering \"yes\" to the setup questions (`CODYN_ASSUME_YES=1` variable);"),
+        ("cria o ambiente virtual em `%USERPROFILE%\\.venv\\CODYN` com exatamente o Python 3.10.11 (no Linux qualquer 3.10 ou superior é aceito) e usa `%USERPROFILE%\\.venv\\CODYN\\Scripts\\python.exe` em todos os comandos de instalação;",
+         "creates the virtual environment at `%USERPROFILE%\\.venv\\CODYN` with exactly Python 3.10.11 (on Linux any 3.10 or later is accepted) and uses `%USERPROFILE%\\.venv\\CODYN\\Scripts\\python.exe` in every installation command;"),
+        ("instala o runtime do Visual C++ exigido pelas DLLs do Qt5 (`winget`; o Windows pede confirmação) e o PyQt5, abre o CODYN e cria os atalhos **CODYN** na Área de Trabalho e no Menu Iniciar.",
+         "installs the Visual C++ runtime required by the Qt5 DLLs (`winget`; Windows asks for confirmation) and PyQt5, opens CODYN and creates the **CODYN** shortcuts on the Desktop and in the Start Menu."),
+    ])
+    m.p(("Depois disso, abra o CODYN pelo atalho: ele inicia com o `pythonw.exe`, **sem janela de console**, e a saída do programa e dos subprocessos aparece em **Ajuda > Terminal** "
+         "(uma janela do PowerShell que acompanha o log da sessão, gravado em `%LOCALAPPDATA%\\CODYN`). O restante é instalado pela janela **Instalar requisitos** (seção 3).",
+         "From then on, open CODYN from the shortcut: it starts with `pythonw.exe`, **without a console window**, and the output of the program and of its subprocesses appears in "
+         "**Help > Terminal** (a PowerShell window that follows the session log, stored in `%LOCALAPPDATA%\\CODYN`). Everything else is installed from the "
+         "**Install requirements** window (section 3)."))
+    m.p(("**Diferenças no Windows:**", "**Differences on Windows:**"), keep_next=True)
+    m.bullets([
+        ("O **GROMACS não tem binário oficial para Windows**: a janela de requisitos o compila a partir do código-fonte em `%USERPROFILE%\\GROMACS`, com o CMake e o Visual Studio Build Tools "
+         "(ambos instalados com `winget`, se ausentes; o CUDA é usado se o CUDA Toolkit existir). A compilação demora muito. Se você já tem um `gmx.exe`, defina a variável de ambiente `CODYN_GMX` com o caminho dele.",
+         "**GROMACS has no official Windows binary**: the requirements window compiles it from source into `%USERPROFILE%\\GROMACS`, using CMake and the Visual Studio Build Tools "
+         "(both installed with `winget` if missing; CUDA is used when the CUDA Toolkit is present). The build takes a long time. If you already have a `gmx.exe`, set the `CODYN_GMX` environment variable to its path."),
+        ("O **Open Babel** vem do pacote pip `openbabel-wheel` e o **Perl** (preparo do CGenFF) do Strawberry Perl, instalado com `winget`.",
+         "**Open Babel** comes from the `openbabel-wheel` pip package and **Perl** (CGenFF preparation) from Strawberry Perl, installed with `winget`."),
+        ("O AmberTools não existe para Windows; por isso o método de ligantes **AMBER/GAFF** (antechamber, acpype) e a **ETAPA 6 (MM/GBSA, gmx_MMPBSA)** estão disponíveis **somente no Linux**. "
+         "No Windows use o campo de força **CHARMM36 com ligantes CGenFF**; as ETAPAS 1 a 5, a aba RESULTADOS (gráficos) e o relatório final funcionam normalmente.",
+         "AmberTools has no Windows build, so the **AMBER/GAFF** ligand method (antechamber, acpype) and **STEP 6 (MM/GBSA, gmx_MMPBSA)** are available on **Linux only**. "
+         "On Windows use the **CHARMM36 force field with CGenFF ligands**; STEPS 1 to 5, the RESULTS tab (plots) and the final report work normally."),
+        ("Use nomes curtos para projetos e ligantes: o Windows limita o caminho completo de um arquivo a 260 caracteres.",
+         "Keep project and ligand names short: Windows limits the full path of a file to 260 characters."),
+    ])
 
     # ============================================================== 3. Requisitos
     m.h1(("Pré-requisitos e instalação de dependências", "Prerequisites and installation of dependencies"))
@@ -83,13 +122,13 @@ def build_a(m, V):
          ("O GROMACS 2024.5 é baixado e compilado em `~/gromacs_build` (com CUDA, se o `nvcc` existir) — demora bastante. O OpenMPI fornece o `mpirun` usado pelo gmx_MMPBSA.",
           "GROMACS 2024.5 is downloaded and compiled in `~/gromacs_build` (with CUDA if `nvcc` exists) — this takes a long time. OpenMPI provides the `mpirun` used by gmx_MMPBSA.")],
         [("**Atalho do menu**", "**Menu shortcut**"), ("criar/atualizar o atalho do CODYN", "create/update the CODYN shortcut"),
-         ("Cria a entrada do CODYN no menu de aplicativos do usuário.", "Creates the CODYN entry in the user's applications menu.")],
+         ("Cria a entrada do CODYN no menu de aplicativos do usuário (no Windows, os atalhos `CODYN.lnk` na Área de Trabalho e no Menu Iniciar).", "Creates the CODYN entry in the user's applications menu (on Windows, the `CODYN.lnk` shortcuts on the Desktop and in the Start Menu).")],
     ], widths=[2.6, 4.4, 8.0], caption=("Grupos da janela de requisitos.", "Groups of the requirements window."))
     m.p(("Use **Selecionar ausentes** para marcar apenas o que falta, **Marcar/Desmarcar tudo**, **Atualizar situação** para reler o sistema e **Instalar selecionados** para iniciar. "
-         "O andamento e os erros aparecem no log da própria janela; pacotes do sistema pedem a senha de administrador por uma janela do sistema. "
+         "O andamento e os erros aparecem no log da própria janela; pacotes do sistema pedem a senha de administrador por uma janela do sistema (no Windows, o `winget` pede a confirmação do Windows). "
          "Se uma instalação falhar, o log indica o item; corrija o problema e execute novamente — itens já instalados são ignorados.",
          "Use **Select missing** to tick only what is missing, **Select/Unselect all**, **Refresh status** to re-read the system and **Install selected** to start. "
-         "Progress and errors appear in the window's own log; system packages ask for the administrator password through a system dialog. "
+         "Progress and errors appear in the window's own log; system packages ask for the administrator password through a system dialog (on Windows, `winget` asks for Windows confirmation). "
          "If an installation fails, the log shows which item; fix the problem and run again — items already installed are skipped."))
     m.note(("A parametrização de ligantes pelo **CGenFF** (campo CHARMM36) usa o servidor web do CGenFF, que exige uma conta acadêmica gratuita (https://cgenff.silcsbio.com). "
             "O CODYN guia esse passo dentro da própria interface (seção 8). Para ligantes **AMBER** (GAFF/GAFF2) nenhuma conta é necessária.",
