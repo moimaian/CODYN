@@ -1,165 +1,111 @@
-import glob
+# -*- coding: utf-8 -*-
+"""STEP 2 — Preparo do complexo proteína-ligante.
+
+pdb2gmx (campo de força e água por NOME, não por índice de menu) + fusão das coordenadas do ligante
++ inclusão do ligante na topologia + geração dos .mdp da execução.
+"""
+
 import os
-import json
-import subprocess
+import re
 import shutil
-from datetime import datetime
-from PyQt5.QtCore import (Qt, QTimer, QThread, pyqtSignal)
-from PyQt5.QtWidgets import QWidget, QTextEdit
+from typing import List, Optional
 
-class PreparoProteina(QThread):
-    log_prot_signal = pyqtSignal(str)    
-    def __init__(self, codyn_dir: str, protein_dir: str, ligands_dir: str,
-                 config_data: dict, run_folder: str, prot_path: str):
-        super().__init__()
-        self.codyn_dir = codyn_dir
-        self.protein_dir = protein_dir
-        self.ligands_dir = ligands_dir
-        self.config_data = config_data
-        self.run_folder = run_folder
-        self.prot_path = prot_path
+from BIN.context import RunContext, StepError
+from BIN.mdp_tools import prepare_mdps
+from BIN.runconfig import LIG_RESNAME
+from BIN.tools import find_obabel
 
-    def log(self, message: str):
-        """Adiciona mensagem no status_prot com timestamp."""
-        self.log_prot_signal.emit(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+STEP = "prot"
+PROT_EXTS = (".pdb", ".pdbqt")
 
-    def edit_topol_top(self, run_folder, nome_ligante):
-        topol_path = os.path.join(run_folder, "topol.top")
-        if not os.path.exists(topol_path):
-            self.log("Arquivo topol.top não encontrado para ajuste.")
-            return
 
-        with open(topol_path, "r") as f:
-            lines = f.readlines()
+def list_proteins(protein_dir: str) -> List[str]:
+    if not os.path.isdir(protein_dir):
+        return []
+    return sorted(f for f in os.listdir(protein_dir)
+                  if os.path.isfile(os.path.join(protein_dir, f)) and os.path.splitext(f)[1].lower() in PROT_EXTS)
 
-        # 1. Inserir antes de [ moleculetype ]
-        prm_block = [
-            "; Include ligand parameters\n",
-            f'#include "{nome_ligante}.prm"\n\n'
-        ]
 
-        # 2. Inserir antes de "; Include water topology"
-        itp_block = [
-            "; Include ligand topology\n",
-            f'#include "{nome_ligante}.itp"\n\n'
-        ]
+def merge_gro(protein_gro: str, ligand_gro: str, out_gro: str, title: str, lig_resnr: Optional[int] = None):
+    """Concatena as coordenadas (átomos) de dois .gro usando a caixa do primeiro."""
+    def read(path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        n = int(lines[1].strip())
+        return lines[2:2 + n], lines[2 + n] if len(lines) > 2 + n else ""
 
-        # Flags para controle de inserção
-        new_lines = []
-        prm_inserted = False
-        itp_inserted = False
+    p_atoms, box = read(protein_gro)
+    l_atoms, _ = read(ligand_gro)
+    if lig_resnr is None:
+        lig_resnr = int(p_atoms[-1][:5]) + 1 if p_atoms else 1
+    l_atoms = [f"{lig_resnr % 100000:>5}" + line[5:] for line in l_atoms]
+    with open(out_gro, "w", encoding="utf-8", newline="\n") as f:
+        f.write(title + "\n")
+        f.write(f"{len(p_atoms) + len(l_atoms)}\n")
+        f.write("\n".join(p_atoms + l_atoms) + "\n")
+        f.write(box + "\n")
 
-        for idx, line in enumerate(lines):
-            # Inserir bloco prm antes de [ moleculetype ] (apenas na primeira ocorrência)
-            if not prm_inserted and "[ moleculetype ]" in line:
-                new_lines.extend(prm_block)
-                prm_inserted = True
-            # Inserir bloco itp antes de "; Include water topology" (apenas na primeira ocorrência)
-            if not itp_inserted and "; Include water topology" in line:
-                new_lines.extend(itp_block)
-                itp_inserted = True
-            new_lines.append(line)
 
-        # Adicionar bloco ao final
-        if not new_lines[-1].endswith("\n"):
-            new_lines[-1] += "\n"
-        new_lines.append(f"{nome_ligante}\t1\n")
+def add_ligand_to_topology(top_path: str, has_prm: bool, resname: str = LIG_RESNAME):
+    """Inclui LIG.prm/LIG.itp antes do primeiro [ moleculetype ] e LIG 1 em [ molecules ]."""
+    with open(top_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    out, done = [], False
+    for line in lines:
+        if not done and re.match(r"\s*\[\s*moleculetype\s*\]", line):
+            if has_prm:
+                out += ["; Include ligand parameters", f'#include "{resname}.prm"', ""]
+            out += ["; Include ligand topology", f'#include "{resname}.itp"', ""]
+            done = True
+        out.append(line)
+    if not done:
+        raise StepError("No [ moleculetype ] found in topol.top.")
+    while out and not out[-1].strip():
+        out.pop()
+    out.append(f"{resname:<20}1")
+    with open(top_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out) + "\n")
 
-        # Salva o arquivo ajustado
-        with open(topol_path, "w") as f:
-            f.writelines(new_lines)
-        self.log(f"Arquivo topol.top ajustado para o ligante {nome_ligante}.")
 
-    def start_preparation(self, nome_proteina: str, nome_ligante: str):
-        try:
-            self.log(f"\n####### COMPLEX PREPARATION START {nome_proteina} {nome_ligante}  #######")
+def _prepare_protein_pdb(ctx: RunContext, protein_dir: str) -> str:
+    files = list_proteins(protein_dir)
+    named = [f for f in files if os.path.splitext(f)[0] == ctx.prot_name]
+    if not named:
+        raise StepError(f"Protein '{ctx.prot_name}' not found in {protein_dir}")
+    src = os.path.join(protein_dir, named[0])
+    dst = ctx.path("protein.pdb")
+    if src.lower().endswith(".pdbqt"):
+        obabel = find_obabel()
+        if not obabel:
+            raise StepError("Open Babel ('obabel') not found; required to convert a .pdbqt protein.")
+        ctx.run(STEP, [obabel, "-ipdbqt", src, "-opdb", "-O", dst], what="obabel (protein pdbqt -> pdb)", quiet=True)
+        ctx.log(STEP, f"Converted {named[0]} to PDB with Open Babel (the original file was kept).")
+    else:
+        shutil.copy2(src, dst)
+        ctx.log(STEP, "Copied protein into run folder.")
+    return dst
 
-            # Preparar diretórios
-            self.log(f"Run directory ready: {self.run_folder}")
 
-            # Copiar arquivos de TARGETS para a pasta de execução
-            shutil.copy2(self.prot_path, self.run_folder)
-            self.log("Copied protein into run folder.")
+def prepare_complex(ctx: RunContext, protein_dir: str):
+    cfg = ctx.cfg
+    ctx.log(STEP, f"####### COMPLEX PREPARATION START {ctx.prot_name} {ctx.lig_name} #######", stamp=False)
+    _prepare_protein_pdb(ctx, protein_dir)
+    ctx.log(STEP, f"Running pdb2gmx: force field {cfg.gmx_ff}, water model {cfg.solvent_model}")
+    args = ["pdb2gmx", "-f", "protein.pdb", "-o", "protein.gro", "-p", "topol.top", "-i", "posre.itp",
+            "-ff", cfg.gmx_ff, "-water", cfg.solvent_model]
+    if cfg.ignore_hydrogens:
+        args.append("-ignh")
+    ctx.gmx_run(STEP, args, quiet=True, what="gmx pdb2gmx")
+    ctx.log(STEP, "Generated protein.gro successfully.")
 
-            # Carregar dados de configuração
-            self.config_data = os.path.join(self.codyn_dir, ".form_data.json")
-            with open(self.config_data, 'r') as f:
-                self.config = json.load(f)
-                ff = self.config["force_field"]  # Campo de força
-                solv = int(self.config["solvent_model"])  # Modelo de Solvente
-            self.log(f"Using Force Field: {ff}, solvent model: {solv}")
-           
-            # GROMACS preprocessing commands
-            gmx = "/usr/local/gromacs/bin/gmx"
-            self.log("Running gmx pdb2gmx")
-            result = subprocess.run(f"{gmx} pdb2gmx -f {nome_proteina}.pdb -o protein.gro", shell=True, cwd=self.run_folder, input=f"{ff}\n{solv}\n", text=True)
-            if result.returncode != 0:
-                self.log(f"Error generating protein.gro with gmx pdb2gmx.")
-            else:
-                self.log(f"Generated protein.gro successfully.")
+    ctx.log(STEP, f"Bringing {LIG_RESNAME} ({ctx.lig_name}) and {ctx.prot_name} together in complex.gro")
+    merge_gro(ctx.path("protein.gro"), ctx.path(f"{LIG_RESNAME}.gro"), ctx.path("complex.gro"),
+              f"CODYN {ctx.lig_name} {ctx.prot_name}")
+    add_ligand_to_topology(ctx.path("topol.top"), has_prm=bool(ctx.state.get("lig_prm")))
+    ctx.log(STEP, "Ligand included in topol.top.")
 
-            # Unindo proteina e ligante
-            self.log(f"Bringing {nome_ligante} and {nome_proteina} together in complex.gro")
-            # Coletar o último número de resíduo da proteína
-            resn_end = None
-            with open(os.path.join(self.run_folder, "protein.gro")) as grof:
-                for line in grof:
-                    if len(line) >= 5 and line[:5].strip().isdigit():
-                        resn = int(line[:5].strip())
-                        resn_end = resn  # Vai sobrescrever até o último átomo
-            self.log(f"Último número de resíduo da proteína: {resn_end}")
-            resn_lig = resn_end + 1  # O ligante começa no próximo resíduo
-            result = subprocess.run(f"{gmx} editconf -f {nome_ligante}.gro -o {nome_ligante}_new.gro -resnr {resn_lig}", shell=True, cwd=self.run_folder, text=True)
-            if result.returncode != 0:
-                self.log(f"Error generating {nome_ligante}_new.gro with gmx editconf.")
-            else:
-                self.log(f"Generated {nome_ligante}_new.gro successfully.")
-
-            # Remove header (2 linhas) e footer (última linha) do ligante
-            self.log(f"Removing header and footer from {nome_ligante}_new.gro")
-            subprocess.run(f"tail -n +3 {nome_ligante}_new.gro | head -n -1 > ligand_atoms.gro", shell=True, cwd=self.run_folder)
-
-            # Remove footer do arquivo da proteína
-            self.log(f"Removing header and footer from protein.gro")
-            subprocess.run(f"tail -n +3 protein.gro | head -n -1  > protein_atoms.gro", shell=True, cwd=self.run_folder)
-
-            # Junta os arquivos
-            self.log("Combining protein and ligand atoms into complex_atoms.gro")
-            subprocess.run(f"cat protein_atoms.gro ligand_atoms.gro > complex_atoms.gro", shell=True, cwd=self.run_folder)
-
-            # Conta o número total de átomos
-            self.log("Counting total number of atoms in complex_atoms.gro")
-            result = subprocess.run("grep -v '^$' complex_atoms.gro | wc -l", shell=True, cwd=self.run_folder, capture_output=True, text=True)
-            n_atoms = result.stdout.strip()
-            self.log(f"Total number of atoms: {n_atoms}")
-
-            # Caminhos dos arquivos
-            complex_atoms_path = os.path.join(self.run_folder, "complex_atoms.gro")
-            protein_gro_path = os.path.join(self.run_folder, "protein.gro")
-            complex_gro_path = os.path.join(self.run_folder, "complex.gro")
-
-            # Leia a última linha (box) do protein.gro
-            with open(protein_gro_path, "r") as f:
-                lines = f.readlines()
-                box_line = lines[-1]
-
-            # Leia os átomos do complex_atoms.gro
-            with open(complex_atoms_path, "r") as f:
-                atoms_data = f.read()
-
-            # Escreva tudo em complex.gro
-            with open(complex_gro_path, "w") as out:
-                out.write(f"CODYN {nome_ligante} {nome_proteina}\n")
-                out.write(f"{n_atoms}\n")
-                out.write(atoms_data)
-                if not atoms_data.endswith('\n'):
-                    out.write('\n')
-                out.write(box_line)
-
-            self.edit_topol_top(self.run_folder, nome_ligante)
-
-            # Finalização
-            self.log("Complex preparation completed successfully.")
-
-        except Exception as e:
-            self.log(f"Error during protein prep: {e}")
+    prepare_mdps(ctx.base_dir, ctx.run_folder, cfg)
+    ctx.log(STEP, f"Generated .mdp files (dt={cfg.dt_ps:g} ps, eq steps={cfg.steps_eq}, production steps={cfg.steps_md}).")
+    if cfg.integration_time_fs > 2.0:
+        ctx.log(STEP, "Warning: integration step > 2 fs normally requires heavy-hydrogen/virtual-site topologies.", stamp=False)
+    ctx.log(STEP, "Complex preparation completed successfully.")

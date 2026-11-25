@@ -1,2000 +1,766 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# CODYN – Computational Platform for Molecular Dynamics
+# Copyright (C) 2025–2026 Moisés Maia
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
 
-# ========================= BOOTSTRAP CODYN (pip-only) =========================
-# venv global por usuário: $HOME/.venv/CODYN
-# - Se não existir, cria e reexecuta dentro dele.
-# - Garante PyQt5 (fixo) p/ exibir UI.
-# - Verifica demais pacotes/versões (fixas) e FERRAMENTAS EXTERNAS (CUDA, GROMACS, gmx_MMPBSA);
-#   se faltar algo, abre o Install Requirements.
-
-import os, sys, subprocess, importlib.util, shutil
-from pathlib import Path
-from typing import Optional
+import os
+import sys
 
 os.environ.setdefault("PYTHONNOUSERSITE", "1")
+CODYN_DIR = os.path.dirname(os.path.abspath(__file__))
+if CODYN_DIR not in sys.path:
+    sys.path.insert(0, CODYN_DIR)
 
-# Versões EXATAS (Python packages)
-PINNED = {
-    "numpy": "1.26.4",
-    "pandas": "2.1.4",
-    "matplotlib": "3.8.4",
-    "scipy": "1.13.1",
-    "psutil": "5.9.8",
-    "rdkit": "2022.09.5",
-    "PyQt5": "5.15.10",  # PyQt5 é a única instalada automaticamente aqui
-}
+from BIN import platform_utils as _pu  # noqa: E402  (só biblioteca padrão)
 
-ROOT = Path(__file__).resolve().parent
-BIN_DIR = ROOT / "BIN"
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(BIN_DIR))
+_IS_WINDOWS = _pu.IS_WINDOWS
+if _IS_WINDOWS:
+    # Todo subprocesso nasce sem janela de console (o atalho usa pythonw.exe, que não tem console).
+    _pu.install_subprocess_defaults()
 
-# ---- helpers gerais ----
-def _which(name: str) -> Optional[str]:
-    return shutil.which(name)
 
-def _venv_paths():
-    venv_dir = Path.home() / ".venv" / "CODYN"
-    if os.name == "nt":
-        py = venv_dir / "Scripts" / "python.exe"
-        pip = venv_dir / "Scripts" / "pip.exe"
-    else:
-        py = venv_dir / "bin" / "python"
-        pip = venv_dir / "bin" / "pip"
-    return venv_dir, py, pip
+def _bootstrap_codyn_venv():
+    """Garante ~/.venv/CODYN + PyQt5 e reexecuta o programa dentro do venv (ver BIN/module_requirements.py)."""
+    if os.environ.get("CODYN_VENV_ACTIVE") == "1":
+        return
+    from BIN.module_requirements import bootstrap_pyqt5
+    if not bootstrap_pyqt5(interactive=True, reexec=True, env_name="CODYN"):
+        sys.exit(1)
 
-def _run(cmd):
-    return subprocess.run(cmd, check=True, text=True)
 
-def _ensure_venv():
-    venv_dir, vpy, vpip = _venv_paths()
-    if not vpy.exists():
-        venv_dir.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[CODYN] Criando venv em {venv_dir} ...")
-        _run([sys.executable, "-m", "venv", str(venv_dir)])
-        _run([str(vpy), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-    return venv_dir, vpy, vpip
+# Saída do programa (prints, erros, subprocessos) num log por sessão, exibido por Help > Terminal.
+CODYN_TERMINAL_LOG_DIR = _pu.terminal_log_dir()   # Linux: ~/.cache/codyn ; Windows: %LOCALAPPDATA%\\CODYN
+CODYN_TERMINAL_LOG = os.path.join(CODYN_TERMINAL_LOG_DIR, f"terminal_{os.getpid()}.log")
+_codyn_tee_proc = None
 
-def _ensure_pyqt5(vpy, vpip):
-    try:
-        import PyQt5  # noqa
-        import PyQt5.QtWidgets  # noqa
-        # Força a versão exata se estiver diferente
-        from PyQt5 import QtCore
-        ver = getattr(QtCore, "__version__", None)
-        if ver and ver != PINNED["PyQt5"]:
-            print(f"[CODYN] PyQt5 versão {ver} != {PINNED['PyQt5']}. Ajustando...")
-            _run([str(vpip), "install", f"PyQt5=={PINNED['PyQt5']}"])
-    except Exception:
-        print("[CODYN] Instalando PyQt5 (necessário para abrir a interface)...")
-        _run([str(vpip), "install", f"PyQt5=={PINNED['PyQt5']}"])
 
-def _reexec_in_venv(vpy):
-    if Path(sys.executable).resolve() != Path(vpy).resolve():
-        print(f"[CODYN] Reexecutando dentro do venv: {vpy}")
-        env = os.environ.copy()
-        env["CODYN_BOOTSTRAPPED"] = "1"
-        os.execve(str(vpy), [str(vpy), __file__], env)
+class _TeeStream:
+    """Windows (sem o comando `tee` nem dup2): copia o que o CODYN imprime para o console, se houver, e
+    para o log da sessão. Aberto pelo atalho (pythonw.exe) não há console e tudo vai só para o log."""
 
-# ---- checagem de pacotes Python pinados ----
-def _missing_or_mismatched_packages():
-    missing = []
-    mismatched = []
-    for mod, ver in PINNED.items():
-        if mod == "PyQt5":
-            continue  # já tratado separadamente
-        try:
-            pkg = __import__(mod)
-            cur = getattr(pkg, "__version__", None)
-            if cur is None or cur != ver:
-                mismatched.append((mod, ver, cur))
-        except Exception:
-            missing.append((mod, ver))
-    return missing, mismatched
+    def __init__(self, console, log_file):
+        self._console, self._log = console, log_file
 
-# ---- checagem de ferramentas externas ----
-def _external_tools_status():
-    """
-    Retorna (missing, details) para:
-      - CUDA Toolkit: precisa de 'nvcc'
-      - GROMACS: precisa de 'gmx'
-      - gmx_MMPBSA: import do módulo Python 'gmx_MMPBSA' OU binário 'gmx_MMPBSA'
-    """
-    missing = []
-    details = []
-
-    # CUDA Toolkit
-    nvcc = _which("nvcc")
-    if not nvcc:
-        missing.append("CUDA Toolkit")
-        details.append(" - CUDA Toolkit: 'nvcc' não encontrado no PATH")
-    else:
-        details.append(f" - CUDA Toolkit: OK ({nvcc})")
-
-    # GROMACS
-    gmx = _which("gmx")
-    if not gmx:
-        # tentar um caminho comum quando instalado via make install
-        if Path("/usr/local/gromacs/bin/gmx").exists():
-            details.append(" - GROMACS: OK (/usr/local/gromacs/bin/gmx)")
-        else:
-            missing.append("GROMACS")
-            details.append(" - GROMACS: 'gmx' não encontrado no PATH")
-    else:
-        details.append(f" - GROMACS: OK ({gmx})")
-
-    # gmx_MMPBSA
-    mmpbsa_bin = _which("gmx_MMPBSA")
-    mmpbsa_mod = importlib.util.find_spec("gmx_MMPBSA")
-    if not (mmpbsa_bin or mmpbsa_mod):
-        missing.append("gmx_MMPBSA")
-        details.append(" - gmx_MMPBSA: nem módulo Python ('gmx_MMPBSA') nem binário 'gmx_MMPBSA' encontrado")
-    else:
-        where = mmpbsa_bin or ("module:" + str(mmpbsa_mod.origin) if mmpbsa_mod and mmpbsa_mod.origin else "module")
-        details.append(f" - gmx_MMPBSA: OK ({where})")
-
-    return missing, details
-
-def _maybe_open_requirements_ui(message: str):
-    # Garante um QApplication e abre a UI do instalador
-    try:
-        from PyQt5.QtWidgets import QApplication, QMessageBox
-    except Exception as e:
-        print("[CODYN] Falha ao importar PyQt5 para exibir UI:", e)
-        # sys.exit(1)
-
-    app = QApplication.instance() or QApplication(sys.argv)
-    reply = QMessageBox.information(None, "Requisitos do CODYN", message, QMessageBox.Ok)
-
-    try:
-        from module_requirements import RequirementsInstaller  # BIN/module_requirements.py
-        w = RequirementsInstaller()
-        w.show()
-        app.exec_()
-    except Exception as e:
-        QMessageBox.critical(None, "Erro",
-            f"Não foi possível abrir o instalador de requisitos:\n{e}\n\n"
-            f"Verifique o arquivo BIN/module_requirements.py.")
-        # sys.exit(1)
-
-def _bootstrap():
-    # 1) Criar/entrar no venv
-    if os.environ.get("CODYN_BOOTSTRAPPED") != "1":
-        venv_dir, vpy, vpip = _ensure_venv()
-        _reexec_in_venv(vpy)
-
-    # 2) Já dentro do venv
-    venv_dir, vpy, vpip = _venv_paths()
-    _ensure_pyqt5(vpy, vpip)
-
-    # 3) Checar pacotes Python pinados
-    missing_py, mismatched_py = _missing_or_mismatched_packages()
-
-    # 4) Checar ferramentas externas
-    missing_ext, ext_details = _external_tools_status()
-
-    if missing_py or mismatched_py or missing_ext:
-        msg_lines = []
-
-        if missing_py:
-            msg_lines.append("Pacotes Python ausentes:")
-            for m, v in missing_py:
-                msg_lines.append(f"  - {m}=={v}")
-
-        if mismatched_py:
-            msg_lines.append("\nPacotes Python com versão diferente da requerida:")
-            for m, want, cur in mismatched_py:
-                msg_lines.append(f"  - {m}: instalado={cur!r}, requerido={want}")
-
-        if missing_ext:
-            msg_lines.append("\nFerramentas externas ausentes:")
-            for name in missing_ext:
-                msg_lines.append(f"  - {name}")
-
-        # Detalhes de diagnóstico das externas
-        if ext_details:
-            msg_lines.append("\nDiagnóstico de ferramentas externas:")
-            msg_lines.extend(ext_details)
-
-        msg_lines.append("\nClique em OK para abrir o instalador de requisitos.")
-        _maybe_open_requirements_ui("\n".join(msg_lines))
-
-        # Revalida após a janela do instalador
-        missing_py2, mismatched_py2 = _missing_or_mismatched_packages()
-        missing_ext2, ext_details2 = _external_tools_status()
-
-        if missing_py2 or mismatched_py2 or missing_ext2:
-            from PyQt5.QtWidgets import QMessageBox, QApplication
-            app = QApplication.instance() or QApplication(sys.argv)
-            final_lines = ["Alguns requisitos ainda não estão atendidos. Tente novamente em 'Install Requirements'.\n"]
-
-            if missing_py2:
-                final_lines.append("Ainda faltam pacotes Python:")
-                for m, v in missing_py2:
-                    final_lines.append(f"  - {m}=={v}")
-            if mismatched_py2:
-                final_lines.append("\nPacotes Python com versão divergente:")
-                for m, want, cur in mismatched_py2:
-                    final_lines.append(f"  - {m}: instalado={cur!r}, requerido={want}")
-            if missing_ext2:
-                final_lines.append("\nAinda faltam ferramentas externas:")
-                for name in missing_ext2:
-                    final_lines.append(f"  - {name}")
-            if ext_details2:
-                final_lines.append("\nDiagnóstico atual das ferramentas externas:")
-                final_lines.extend(ext_details2)
-
-            QMessageBox.warning(None, "CODYN", "\n".join(final_lines))
-            # sys.exit(1)
-
-_bootstrap()
-# ======================= FIM DO BOOTSTRAP CODYN ==============================
-
-
-# IMPORTANDO AS BIBLIOTECAS PARA CODYN.py:
-import sys
-import os
-import re
-import json
-import subprocess
-import webbrowser
-from datetime import datetime
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QStyle,
-    QTabWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QAction, QMessageBox,
-    QFileDialog, QSizePolicy, QSplitter, QTextEdit,
-    QCheckBox, QGridLayout, QComboBox, QFormLayout,
-    QSpacerItem, QGroupBox, QProgressBar, QPlainTextEdit
-)
-from PyQt5.QtGui import QPixmap, QGuiApplication
-from PyQt5.QtCore import (Qt, QTimer, QThread, pyqtSignal, QEventLoop)
-
-from BIN import (module_protein, module_ligands, module_cell, module_equilibration_nvt, module_equilibration_npt, module_production, module_view )
-from BIN.splash_screen import SplashScreen
-from BIN.config_form import ConfiguracaoDinamica
-from BIN.module_requirements import RequirementsInstaller
-
-# CRIANDO A CLASSE PARA EXECUÇÃO DAS ETAPAS EM THREADS:
-class RunWorkerThread(QThread):
-    update_tab_signal = pyqtSignal(int)
-    log_prot_signal = pyqtSignal(str)
-    log_cell_signal = pyqtSignal(str)
-    log_eq_signal = pyqtSignal(str)
-    log_md_signal = pyqtSignal(str)
-    log_lig_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(bool)
-    alert_signal = pyqtSignal(str, str)
-    log_progress_step_signal = pyqtSignal(int)  # Sinal para atualizar a barra de progresso dos steps
-    log_progress_stepmax_signal = pyqtSignal(int)  # Sinal para atualizar o valor máximo na barra de progresso dos steps
-    log_progress_time_signal = pyqtSignal(int)  # Sinal para atualizar a barra de progresso do tempo
-    update_run_folders_signal = pyqtSignal(list) # Sinal para atualizar a lista de pastas em run_folders
-
-    def __init__(self, tabs, tab_config, codyn_dir, run_folders_info, lig_dir, prot_dir):
-        super().__init__()
-        self.tabs = tabs
-        self.tab_config = tab_config
-        self.codyn_dir = codyn_dir
-        self.run_folders_info = run_folders_info
-        self.lig_dir = lig_dir
-        self.prot_dir = prot_dir    
-        # self.cancel_requested = False
-
-    def request_cancel(self):
-        self.cancel_requested = True
-
-    def run(self):
-        self.cancel_requested = False  # Reset flag at start
-        self.lig_dir = self.tab_config.lig_dir.text()
-        self.prot_dir = self.tab_config.prot_dir.text()
-        self.update_tab_signal.emit(2) # STEP 1
-
-        # Loop para preparo dos ligantes em cada pasta de execução:
-        for info in self.run_folders_info:
-            if self.cancel_requested:
-                break  # Interrompe o loop se cancelado
-            nome_ligante = info["nome_ligante"]
-            # Passa para a classe PreparoLigantes em module_ligands.py
-            prep_lig = module_ligands.PreparoLigantes(
-                self.codyn_dir,
-                self.lig_dir
-            )
-            prep_lig.log_lig_signal.connect(self.log_lig_signal.emit)  # Conecta o sinal de log
-            prep_lig.alert_signal.connect(self.alert_signal.emit)  # Conecta o sinal de alerta
-            prep_lig.start_preparation(nome_ligante, run_folder=info["run_folder"])
-
-        # QTimer.singleShot(1000, lambda: self.tabs.setCurrentIndex(3))
-        self.update_tab_signal.emit(3)  # STEP 2
-
-        if self.cancel_requested:
-            return  # Não continua para as próximas etapas
-
-        # PREPARO DA PROTEÍNA:
-        # Verifica extensão e prepara nome_proteina
-        prot_files = [f for f in os.listdir(self.prot_dir.strip()) if os.path.isfile(os.path.join(self.prot_dir.strip(), f))]
-        if len(prot_files) != 1:
-            self.log_prot_signal.emit("Attention!", "It is only possible to perform the dynamics with one protein at a time.\nPlace only one file in the proteins folder.")
-            self.cancel_requested = True
-            return
-        prot_file = prot_files[0]
-        ext = os.path.splitext(prot_file)[1].lower()
-        if ext not in [".pdb", ".pdbqt"]:
-            self.log_prot_signal.emit("Attention!", "The protein file must have a .pdb or .pdbqt extension.")
-            return
-        nome_proteina = os.path.splitext(prot_file)[0]
-
-        # Se for .pdbqt, converte para .pdb usando obabel
-        prot_path = os.path.join(self.prot_dir, prot_file)
-        if ext == ".pdbqt":
-            pdb_path = os.path.join(self.prot_dir.strip(), f"{nome_proteina}.pdb")
-            subprocess.run(f'obabel "{prot_path}" -O "{pdb_path}"', shell=True)
-            os.remove(prot_path)  # Remove o arquivo .pdbqt original
-            msg = f"[{datetime.now().strftime('%H:%M:%S')}] Arquivo {prot_file} convertido para {nome_proteina}.pdb usando Open Babel."
-            self.log_prot_signal.emit(msg)
-            prot_path = pdb_path  # Atualiza para o .pdb recém-criado
-
-        # PREPARO DO COMPLEXO:
-        # Loop para preparo do complexo em cada pasta de execução:
-        for info in self.run_folders_info:
-            if self.cancel_requested:
-                break
-            nome_proteina = info["nome_proteina"]
-            nome_ligante=info["nome_ligante"]
-            run_folder=info["run_folder"]
-            config_data = os.path.join(self.codyn_dir, ".form_data.json")
-            prep_prot = module_protein.PreparoProteina(
-                self.codyn_dir,
-                self.prot_dir.strip(),
-                self.lig_dir.strip(),
-                config_data,
-                run_folder,
-                prot_path
-            )
-            prep_prot.log_prot_signal.connect(self.log_prot_signal.emit)  # Conecta o sinal de log
-            prep_prot.start_preparation(nome_proteina, nome_ligante)
-
-        if self.cancel_requested:
-            return        
-
-        # QTimer.singleShot(1000, lambda: self.tabs.setCurrentIndex(4))
-        self.update_tab_signal.emit(4)  # STEP 3
-
-        # Loop para preparo da Célula Unitária e Minimização:
-        self.prep_cells = [] # Lista para armazenar instâncias de PreparoCell
-        for info in self.run_folders_info:            
-            if self.cancel_requested:
-                break
-            nome_proteina = info["nome_proteina"]
-            nome_ligante = info["nome_ligante"]
-            run_folder = info["run_folder"]
-            config_data = os.path.join(self.codyn_dir, ".form_data.json")
-            prep_cell = module_cell.PreparoCell(
-                self.codyn_dir,
-                config_data,
-                run_folder
-            )
-            prep_cell.log_cell_signal.connect(self.log_cell_signal.emit)
-            self.prep_cells.append(prep_cell)  # Salva a referência!
-            prep_cell.start_preparation(nome_proteina, nome_ligante)
-            if hasattr(prep_cell, 'min_thread'):
-                prep_cell.min_thread.wait()  # Espera terminar antes de seguir
-
-        if self.cancel_requested:
-            return
-
-        # QTimer.singleShot(1000, lambda: self.tabs.setCurrentIndex(5))
-        self.update_tab_signal.emit(5)  # STEP 4
-        
-        # Loop para equilibração NVT:
-        self.prep_nvts = [] # Lista para armazenar instâncias de PrepNVT
-        for info in self.run_folders_info:
-            if self.cancel_requested:
-                break
-            nome_proteina = info["nome_proteina"]
-            nome_ligante = info["nome_ligante"]
-            run_folder = info["run_folder"]
-            config_data = os.path.join(self.codyn_dir, ".form_data.json")
-            prep_nvt = module_equilibration_nvt.PrepNVT(
-                self.codyn_dir,
-                config_data,
-                run_folder
-            )
-            prep_nvt.log_eq_signal.connect(self.log_eq_signal.emit)
-            self.prep_nvts.append(prep_nvt)  # Salva a referência!
-            prep_nvt.start_equilibration(nome_proteina, nome_ligante)
-            if hasattr(prep_nvt, 'nvt_thread'):
-                prep_nvt.nvt_thread.wait()  # Espera terminar antes de seguir
-
-        if self.cancel_requested:
-            return
-
-        # Loop para equilibração NPT:
-        self.prep_npts = [] # Lista para armazenar instâncias de PrepNPT
-        for info in self.run_folders_info:
-            if self.cancel_requested:
-                break
-            nome_proteina = info["nome_proteina"]
-            nome_ligante = info["nome_ligante"]
-            run_folder = info["run_folder"]
-            config_data = os.path.join(self.codyn_dir, ".form_data.json")
-            prep_npt = module_equilibration_npt.PrepNPT(
-                self.codyn_dir,
-                config_data,
-                run_folder
-            )
-            prep_npt.log_eq_signal.connect(self.log_eq_signal.emit)
-            self.prep_npts.append(prep_npt)  # Salva a referência!
-            npt_thread = prep_npt.start_equilibration(nome_proteina, nome_ligante)
-            if npt_thread is not None:
-                npt_thread.wait()
-            else:
-                self.log_eq_signal.emit("NPT thread não foi criada corretamente.")
-
-
-        if self.cancel_requested:
-            return
-
-        # QTimer.singleShot(1000, lambda: self.tabs.setCurrentIndex(6))
-        self.update_tab_signal.emit(6)  # STEP 5
-        # Atualiza a lista de pastas RUN na aba de mmpbsa e visualização
-        runs_dir = os.path.join(self.codyn_dir, "RUNS")
-        all_run_folders = [
-            d for d in os.listdir(runs_dir)
-            if os.path.isdir(os.path.join(runs_dir, d))
-        ]
-        self.update_run_folders_signal.emit(all_run_folders)
-
-        # Inicia a produção de dinâmica molecular:
-        # Loop para MD Production:
-        self.prep_mds = [] # Lista para armazenar instâncias de PrepMD
-        for info in self.run_folders_info:
-            if self.cancel_requested:
-                break
-            nome_proteina = info["nome_proteina"]
-            nome_ligante = info["nome_ligante"]
-            run_folder = info["run_folder"]
-            config_data = os.path.join(self.codyn_dir, ".form_data.json")
-            prep_md = module_production.PrepMD(
-                self.codyn_dir,
-                config_data,
-                run_folder
-            )
-            prep_md.log_md_signal.connect(self.log_md_signal.emit)
-            prep_md.log_progress_step_signal.connect(self.log_progress_step_signal.emit)
-            prep_md.log_progress_stepmax_signal.connect(self.log_progress_stepmax_signal.emit)
-            prep_md.log_progress_time_signal.connect(self.log_progress_time_signal.emit)
-            self.prep_mds.append(prep_md)  # Salva a referência!
-            
-            loop = QEventLoop()
-            def on_md_finished(_):
-                loop.quit()
-            # Conecta o sinal de término da thread de produção
-            def connect_thread_and_start():
-                # Garante que a thread foi criada
-                if hasattr(prep_md, 'MD_Thread'):
-                    prep_md.MD_Thread.finished_signal.connect(on_md_finished)
-                else:
-                    # Se a thread ainda não existe, conecta após a criação
-                    orig_start = prep_md.start_production
-                    def wrapped_start(*args, **kwargs):
-                        orig_start(*args, **kwargs)
-                        if hasattr(prep_md, 'MD_Thread'):
-                            prep_md.MD_Thread.finished_signal.connect(on_md_finished)
-                    prep_md.start_production = wrapped_start
-            connect_thread_and_start()
-            prep_md.start_production(nome_proteina, nome_ligante)
-            loop.exec_()  # Espera até a thread terminar
-
-        if self.cancel_requested:
-            return
-        
-         # Muda para a aba de análise e visualização
-        self.update_tab_signal.emit(7)  # STEP 6
-
-class MMPBSAWorker(QThread):    
-    log_mmpbsa_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(bool)
-    alert_signal = pyqtSignal(str, str)
-    update_tab_signal = pyqtSignal(int)
-
-    def __init__(self, n_threads, t_ns_md_list, run_folders, params):
-        super().__init__()
-        self.n_threads = n_threads
-        self.t_ns_md_list = t_ns_md_list
-        self.run_folders = run_folders
-        self.params = params
-    
-    def request_cancel(self):
-        self.cancel_requested = True
-
-    def run(self):
-        self.cancel_requested = False  # Reset flag at start
-        try:
-            self.log_mmpbsa_signal.emit(f"Time production values in runs folders: {self.t_ns_md_list}")
-            if not self.t_ns_md_list:
-                self.t_ns_md = None
-                for run_folder in self.run_folders:
-                    for fname in os.listdir(run_folder):
-                        match = re.search(r"md_0_([\d\.]+)\.xtc", fname)
-                        if match:
-                            self.t_ns_md = match.group(1)
-                            break
-                    if self.t_ns_md:
-                        break
-                if not self.t_ns_md:
-                    self.alert_signal.emit("Erro", "Não foi possível determinar t_ns_md automaticamente.")
-                    self.finished_signal.emit(False)
-                    return
-            else:                
-                for run_folder, t_ns_md in zip(self.run_folders, self.t_ns_md_list):
-                    self.t_ns_md = t_ns_md
-                    if self.cancel_requested:
-                        break
-                    self.log_mmpbsa_signal.emit(f"N_THREADS: {self.n_threads}, T_NS_MD: {self.t_ns_md}")
-                    required_files = [
-                        "mmpbsa.in",
-                        f"md_0_{self.t_ns_md}.tpr",
-                        "index.ndx",
-                        f"md_0_{self.t_ns_md}_noPBC.xtc",
-                        "topol.top"
-                    ]
-                    # Verifica se todos os arquivos necessários estão presentes:
-                    for fname in required_files:
-                        if not os.path.exists(os.path.join(run_folder, fname)):
-                            self.log_mmpbsa_signal.emit(f"Arquivo faltando: {fname}")
-                        else:
-                            self.log_mmpbsa_signal.emit(f"Found required file: {fname}")
-                    cmd = [f"mpirun -np {self.n_threads} gmx_MMPBSA MPI -O -i mmpbsa.in -cs md_0_{self.t_ns_md}.tpr -ci index.ndx -cg 1 13 -ct md_0_{self.t_ns_md}_noPBC.xtc -cp topol.top -o FINAL_RESULTS_MMPBSA.dat -eo FINAL_RESULTS_MMPBSA.csv"]
-                    self.log_mmpbsa_signal.emit("comando: " + " ".join(cmd))
-                    process = subprocess.Popen(
-                        cmd,
-                        cwd=run_folder,
-                        shell=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        universal_newlines=True
-                    )
-                    self.log_mmpbsa_signal.emit(f"Executando gmx_MMPBSA em {run_folder}")
-                    for line in process.stdout:
-                        self.log_mmpbsa_signal.emit(line.strip())
-                    process.wait()
-                    self.log_mmpbsa_signal.emit(f"Subprocesso finalizado com código {process.returncode}")
-                    if process.returncode == 0:
-                        self.log_mmpbsa_signal.emit("MMPBSA/MMGBSA finalizado com sucesso!")                    
-                    else:
-                        self.alert_signal.emit("Erro", f"Execução falhou com código {process.returncode}")
-                        self.finished_signal.emit(False)
-                # Sinaliza finalização
-                self.update_tab_signal.emit(8)
-                self.finished_signal.emit(True)
-        except Exception as e:
-            self.alert_signal.emit("Erro", str(e))
-            self.finished_signal.emit(False)
-
-
-# CRIANDO A CLASSE PRINCIPAL DA APLICAÇÃO:
-class MainWindow(QMainWindow):   
-    # Inicializando a janela principal:
-    def __init__(self):        
-        super().__init__()
-        self.cancel_requested = False
-        self.mmpbsa_workers = []        
-
-        # Diretórios do projeto
-        self.codyn_dir = os.path.abspath(os.path.dirname(__file__))
-        self.run_folder = None
-        self.lig_dir = None
-        self.prot_dir = None
-        
-        # Diretórios de corridas anteriores:
-        runs_dir = os.path.join(self.codyn_dir, "RUNS")
-        self.old_run_folders = [f for f in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, f))]
-
-        # Título da janela
-        self.setWindowTitle("CODYN - Computational Methods for Molecular Dynamics")
-
-        # Obter o tamanho da tela
-        screen = QGuiApplication.primaryScreen()
-        size = screen.availableGeometry()
-        width = size.width() // 2
-        height = size.height() // 2
-
-        # Redimensionar e centralizar a janela
-        self.resize(width, height)
-        x = (size.width() - width) // 2
-        y = (size.height() - height) // 2
-        self.move(x, y)
-       
-        # Codyn Menu Bar        
-        menu_bar = self.menuBar()  
-        codyn_menu = menu_bar.addMenu("Menu")        
-        new_action = QAction("Configure New Run", self)
-        new_action.triggered.connect(lambda: self.tabs.setCurrentIndex(1))  # Configuration tab
-        codyn_menu.addAction(new_action)
-        step1_action = QAction("Step 1 - Ligands Preparation", self)
-        step1_action.triggered.connect(lambda: self.tabs.setCurrentIndex(2))  # Step 1
-        codyn_menu.addAction(step1_action)
-        step2_action = QAction("Step 2 - Complex Preparation", self)
-        step2_action.triggered.connect(lambda: self.tabs.setCurrentIndex(3))  # Step 2
-        codyn_menu.addAction(step2_action)
-        step3_action = QAction("Step 3 - Cell Unit Preparation", self)
-        step3_action.triggered.connect(lambda: self.tabs.setCurrentIndex(4))  # Step 3
-        codyn_menu.addAction(step3_action)
-        step4_action = QAction("Step 4 - System Equilibration", self)
-        step4_action.triggered.connect(lambda: self.tabs.setCurrentIndex(5))  # Step 4
-        codyn_menu.addAction(step4_action)
-        step5_action = QAction("Step 5 - Molecular Dynamics Production", self)
-        step5_action.triggered.connect(lambda: self.tabs.setCurrentIndex(6))  # Step 5
-        codyn_menu.addAction(step5_action)
-        step6_action = QAction("Step 6 - Calculate MMPBSA/MMGBSA", self)
-        step6_action.triggered.connect(lambda: self.tabs.setCurrentIndex(7))  # Step 6
-        codyn_menu.addAction(step6_action)
-        step7_action = QAction("Results Visualization", self)
-        step7_action.triggered.connect(lambda: self.tabs.setCurrentIndex(8))  # Step 7
-        codyn_menu.addAction(step7_action)
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close)
-        codyn_menu.addAction(exit_action)
-        
-        # Help Menu        
-        help_menu = menu_bar.addMenu("Help")
-        about_action = QAction("About Us", self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
-
-        # Tab Widget
-        self.tabs = QTabWidget()
-        self.tabs.tabBar().setExpanding(True)
-        self.setCentralWidget(self.tabs)
-
-        # Tabs
-        self.tab_home = QWidget()
-        self.tab_config = ConfiguracaoDinamica(self.codyn_dir, self.tabs)
-        self.tab1 = QWidget() # Preparo Ligantes
-        self.tab2 = QWidget() # Preparo do Complexo
-        self.tab3 = QWidget() # Preparo Célula Unitária
-        self.tab4 = QWidget() # Equilíbrio do Sistema
-        self.tab5 = QWidget() # Produção
-        self.tab6 = QWidget() # Cálculo do MMPBSA/MMGBSA
-        self.tab7 = QWidget() # Análise e Visualização
-
-        # Add tabs to the tab widget
-        self.tabs.addTab(self.tab_home, "HOME")
-        self.tabs.addTab(self.tab_config, "CONFIG")
-        self.tabs.addTab(self.tab1, "STEP 1")
-        self.tabs.addTab(self.tab2, "STEP 2")
-        self.tabs.addTab(self.tab3, "STEP 3")
-        self.tabs.addTab(self.tab4, "STEP 4")
-        self.tabs.addTab(self.tab5, "STEP 5")
-        self.tabs.addTab(self.tab6, "STEP 6")
-        self.tabs.addTab(self.tab7, "RESULTS")
-
-        # Initialize tabs
-        self.init_tab_home()
-        self.tab_config.saved.connect(self.start_config_run_thread)
-        self.init_tab1()
-        self.init_tab2()
-        self.init_tab3()
-        self.init_tab4()
-        self.init_tab5()
-        self.init_tab6()
-        self.init_tab7()
-        
-        self.merge_state = {
-            "base_file": None,     # caminho do primeiro .xvg (define X e já fornece 1º Y)
-            "base_x": None,        # lista de floats (coluna X do primeiro arquivo)
-            "base_label": None,    # nome exibido do primeiro arquivo
-            "y_series": []         # lista de dicts: {"file": str, "label": str, "y": list[float]}
-        }
-
-    def init_tab_home(self):
-        layout = QVBoxLayout()
-        layout.setAlignment(Qt.AlignCenter)
-        
-        layout.addStretch()  # Espaço flexível no topo para centralização vertical
-        
-        # Logo
-        logo_label = QLabel()
-        logo_path = os.path.join(self.codyn_dir, "ICONS", "LOGO_CODYN2.png")
-        if os.path.exists(logo_path):
-            pix = QPixmap(logo_path).scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            logo_label.setPixmap(pix)
-        else:
-            logo_label.setText("Logo not found")
-        logo_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(logo_label)        
-        layout.addSpacing(10)  # Pequeno espaço fixo entre logo e título
-        
-        # Título
-        title1 = QLabel("Computational Methods for Molecular Dynamics")
-        title1.setAlignment(Qt.AlignCenter)
-        title1.setStyleSheet("font-size:14pt;font-weight:bold;")
-        layout.addWidget(title1)
-
-        title2 = QLabel("Current version limited to protein/multi-ligand systems")
-        title2.setAlignment(Qt.AlignCenter)
-        title2.setStyleSheet("font-size:10pt;font-style:italic;")
-        layout.addWidget(title2)
-
-        # Botão Start abaixo do splitter
-        layout.addStretch()
-        layout.addSpacing(100)
-        start_btn = QPushButton("START")
-        start_btn.setFixedWidth(120)
-        start_btn.setStyleSheet("""
-QPushButton {
-    background-color: #FFFFFF;   /* Cinza claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 14pt;
-    font-weight: bold;
-    border: 1px solid #333333;   /* Borda cinza escuro */
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #CCCCCC;   /* Cinza médio ao passar o mouse */
-    color: #000000;
-}
-QPushButton:pressed {
-    background-color: #666666;   /* Cinza escuro ao clicar */
-    color: #000000;
-}
-""")
-        start_btn.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
-        layout.addWidget(start_btn, alignment=Qt.AlignCenter)
-
-        # Botão Exit centralizado logo abaixo do botão Start
-        layout.addStretch()
-        layout.addSpacing(100)
-        install_btn = QPushButton("Install requirements")
-        install_btn.setFixedWidth(200)
-        install_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: none;
-                color: #cccccc;
-                font-size: 12pt;
-                font-weight: bold;
-            }
-            QPushButton:hover, QPushButton:pressed {
-                color: #000000;
-                background: transparent;
-                border: none;
-            }
-        """)
-        install_btn.clicked.connect(self.show_requirements_installer)
-        layout.addWidget(install_btn, alignment=Qt.AlignCenter)
-
-        layout.addStretch()  # Espaço flexível em baixo para centralização vertical
-
-        self.tab_home.setLayout(layout)
-
-    def init_tab1(self):
-        main_layout = QVBoxLayout()
-        label = QLabel("Step 1 - Ligands Preparation")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:14pt;font-weight:bold;")
-        main_layout.addWidget(label)
-        main_layout.addSpacing(10)  # Espaço fixo entre o título e o status
-
-        # Status do preparo dos ligantes
-        status_lig = QTextEdit()
-        status_lig.setReadOnly(True)
-        status_lig.setStyleSheet("background-color: #333333; font-family: monospace; color: #FFFFFF;")
-        self.status_lig = status_lig
-        main_layout.addWidget(status_lig)
-
-        # Botão Cancelar
-        btn_cancel = QPushButton("CANCEL")
-        btn_cancel.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-        QPushButton {
-            background-color: #FFA07A;   /* Vermelho salmão claro */
-            color: #333333;              /* Cinza escuro */
-            font-size: 12pt;
-            font-weight: bold;
-            border: 1px solid #333333; /* Borda cinza escuro */
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-            color: #000000;  /* Preto */
-        }
-        QPushButton:pressed {
-            background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-            color: #000000;  /* Preto */
-        }
-        """)
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        main_layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-        main_layout.addSpacing(10)
-        self.tab1.setLayout(main_layout)
-
-    def init_tab2(self):
-        main_layout = QVBoxLayout()
-        label = QLabel("Step 2 - Complex Preparation")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:14pt;font-weight:bold;")
-        main_layout.addWidget(label)
-        main_layout.addSpacing(10)  # Espaço fixo entre o título e o status
-
-        # Status do preparo do complexo
-        status_prot = QTextEdit()
-        status_prot.setReadOnly(True)
-        status_prot.setStyleSheet("background-color: #333333; font-family: monospace; color: #FFFFFF;")
-        self.status_prot = status_prot
-        main_layout.addWidget(status_prot)
-
-        # Botão Cancelar
-        btn_cancel = QPushButton("CANCEL")
-        btn_cancel.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-        QPushButton {
-            background-color: #FFA07A;   /* Vermelho salmão claro */
-            color: #333333;              /* Cinza escuro */
-            font-size: 12pt;
-            font-weight: bold;
-            border: 1px solid #333333; /* Borda cinza escuro */
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-            color: #000000;  /* Preto */
-        }
-        QPushButton:pressed {
-            background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-            color: #000000;  /* Preto */
-        }
-        """)
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        main_layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-        main_layout.addSpacing(10)
-        self.tab2.setLayout(main_layout)
-    
-    def init_tab3(self):
-        main_layout = QVBoxLayout()
-        label = QLabel("Step 3 - Unit Cell Preparation and Minimization")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:14pt;font-weight:bold;")
-        main_layout.addWidget(label)
-        main_layout.addSpacing(10)  # Espaço fixo entre o título e o status
-
-        # Status do preparo da célula unitária
-        status_cell = QTextEdit()
-        status_cell.setReadOnly(True)
-        status_cell.setStyleSheet("background-color: #333333; font-family: monospace; color: #FFFFFF;")
-        self.status_cell = status_cell
-        main_layout.addWidget(status_cell)
-
-        # Botão Cancelar
-        btn_cancel = QPushButton("CANCEL")
-        btn_cancel.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-        QPushButton {
-            background-color: #FFA07A;   /* Vermelho salmão claro */
-            color: #333333;              /* Cinza escuro */
-            font-size: 12pt;
-            font-weight: bold;
-            border: 1px solid #333333; /* Borda cinza escuro */
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-            color: #000000;  /* Preto */
-        }
-        QPushButton:pressed {
-            background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-            color: #000000;  /* Preto */
-        }
-        """)
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        main_layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-        main_layout.addSpacing(10)
-        self.tab3.setLayout(main_layout)
-
-    def init_tab4(self):
-        main_layout = QVBoxLayout()
-        label = QLabel("Step 4 - System Equilibration")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:14pt;font-weight:bold;")
-        main_layout.addWidget(label)
-        main_layout.addSpacing(10)  # Espaço fixo entre o título e o status
-
-        # Status do equilíbrio do sistema
-        status_eq = QTextEdit()
-        status_eq.setReadOnly(True)
-        status_eq.setStyleSheet("background-color: #333333; font-family: monospace; color: #FFFFFF;")
-        self.status_eq = status_eq
-        main_layout.addWidget(status_eq)
-
-        # Botão Cancelar
-        btn_cancel = QPushButton("CANCEL")
-        btn_cancel.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-QPushButton {
-    background-color: #FFA07A;   /* Vermelho salmão claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #333333; /* Borda cinza escuro */
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-    color: #000000;  /* Preto */
-}
-QPushButton:pressed {
-    background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-    color: #000000;  /* Preto */
-}
-""")
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        main_layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-        main_layout.addSpacing(10)
-        self.tab4.setLayout(main_layout)
-
-    def init_tab5(self):
-        main_layout = QVBoxLayout()
-        label = QLabel("Step 5 - Molecular Dynamics Production")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:14pt;font-weight:bold;")
-        main_layout.addWidget(label)
-        main_layout.addSpacing(10)  # Espaço fixo entre o título e o status
-
-        # Status da produção
-        status_prod = QTextEdit()
-        status_prod.setReadOnly(True)
-        status_prod.setStyleSheet("background-color: #333333; font-family: monospace; color: #FFFFFF;")
-        self.status_prod = status_prod
-        main_layout.addWidget(status_prod)
-
-        # Duas colunas de opções
-        col_layout = QHBoxLayout()
-
-        # Barra de progresso para Steps
-        self.progress_step = QProgressBar()
-        self.progress_step.setFormat("Step: %v")
-        self.progress_step.setStyleSheet("font-size:10pt;font-weight:bold;")
-        self.progress_step.setMinimum(0)
-        self.progress_step.setMaximum(1)
-        self.progress_step.setValue(0)
-        col_layout.addWidget(self.progress_step)
-
-        # ---- Coluna Direita ----
-        right_col = QVBoxLayout()
-
-        # Barra de progresso para tempo restante
-        self.progress_time = QProgressBar()
-        self.progress_time.setFormat("Remaining Time:  --:--:-- ")
-        self.progress_time.setStyleSheet("font-size:10pt;font-weight:bold;")
-        self.progress_time.setMinimum(0)
-        # self.progress_time.setMaximum(60)
-        self.progress_time.setValue(0)
-
-        col_layout.addWidget(self.progress_time)
-
-        # Definindo os fatores de expansão
-        col_layout.setStretch(0, 3)  # self.progress_step ocupa 3 partes
-        col_layout.setStretch(1, 1)  # self.progress_time 
-        main_layout.addLayout(col_layout)
-
-        # Botão Cancelar
-        btn_cancel = QPushButton("CANCEL")
-        btn_cancel.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-QPushButton {
-    background-color: #FFA07A;   /* Vermelho salmão claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #333333; /* Borda cinza escuro */
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-    color: #000000;  /* Preto */
-}
-QPushButton:pressed {
-    background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-    color: #000000;  /* Preto */
-}
-""")
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        main_layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-        main_layout.addSpacing(10)
-        self.tab5.setLayout(main_layout)
-
-    def init_tab6(self):
-        # Layout principal
-        main_layout = QVBoxLayout()
-        self.form_widget = QWidget()
-        form_layout = QFormLayout(self.form_widget)
-
-        # Label centralizada no topo:
-        label = QLabel("Step 6 - Calculate MMPBSA/MMGBSA")
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet("font-size:14pt;font-weight:bold;")
-        main_layout.addWidget(label)
-        main_layout.addSpacing(10)
-        
-        # -------- Seleção da pasta para execução --------   
-        self.combo_run_folder_mmpbsa = QComboBox()
-        self.combo_run_folder_mmpbsa.addItems(self.old_run_folders)
-        form_layout.addRow("Select Run Folder:", self.combo_run_folder_mmpbsa)
-
-        # -------- Campo de Força como ComboBox --------
-        self.ff = QComboBox()
-        self.ff.addItems([
-            "1 - Charmm36_2021",
-            "6 - AMBER99SB",
-            "9 - Charmm27",
-            "15 - GROMOS96_54a7",
-            "16 - OPLS_AA/L"
-        ])
-        form_layout.addRow("Force Field:", self.ff)
-
-        # -------- Presets para preenchimento dos campos de texto--------
-        self.n_threads = QLineEdit(str((os.cpu_count())//2))  # Número de threads
-        self.frame_start = QLineEdit("1")
-        self.frame_end = QLineEdit("2000")
-        self.interval = QLineEdit("1")
-        self.verbose = QLineEdit("2")
-        self.igb = QLineEdit("5")
-        self.sltcon = QLineEdit("0.15")
-        self.probe_radius = QLineEdit("1.4")
-        self.istrng = QLineEdit("0.15")
-        self.fill_ratio = QLineEdit("4.0")
-        self.idecomp = QLineEdit("2")
-        self.dec_verbose = QLineEdit("3")
-
-
-        # -------- Adicionando campos ao formulário --------
-        form_layout.addRow("n_threads:", self.n_threads)  # Número de threads
-        form_layout.addRow("Start Frame:", self.frame_start)
-        form_layout.addRow("End Frame:", self.frame_end)
-        form_layout.addRow("Interval:", self.interval)
-        form_layout.addRow("verbose:", self.verbose)
-        form_layout.addRow("GBSA-igb:", self.igb)
-        form_layout.addRow("GBSA-saltcon:", self.sltcon)
-        form_layout.addRow("GBSA-probe:", self.probe_radius)
-        form_layout.addRow("PBSA-istrng:", self.istrng)
-        form_layout.addRow("PBSA-fillratio:", self.fill_ratio)
-        form_layout.addRow("Decomp-idecomp:", self.idecomp)
-        form_layout.addRow("Decomp-verbose:", self.dec_verbose)
-
-
-        # Adicionando o layout do formulário ao layout principal
-        main_layout.addWidget(self.form_widget)
-
-        # Caixa de status para logs do MMPBSA (inicialmente oculta)
-        self.status_mmpbsa = QTextEdit()
-        self.status_mmpbsa.setReadOnly(True)
-        self.status_mmpbsa.setStyleSheet("background-color: #333333; font-family: monospace; color: #FFFFFF;")
-        self.status_mmpbsa.hide()  # Oculta inicialmente
-        main_layout.addWidget(self.status_mmpbsa)
-
-        # Botões
-        # Layout horizontal para os botões
-        button_layout = QHBoxLayout()
-
-        # Botão Cancelar
-        btn_cancel = QPushButton("CANCEL")
-        btn_cancel.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-QPushButton {
-    background-color: #FFA07A;   /* Vermelho salmão claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #333333; /* Borda cinza escuro */
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-    color: #000000;  /* Preto */
-}
-QPushButton:pressed {
-    background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-    color: #000000;  /* Preto */
-}
-""")
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        button_layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-
-        # Botão RUN centralizado
-        run_btn_single = QPushButton("SINGLE RUN")
-        run_btn_single.setFixedWidth(150)
-        run_btn_single.setStyleSheet("""
-QPushButton {
-    background-color: #B7E4C7;   /* Verde pastel claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #222;
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #74C69D;   /* Verde pastel médio ao passar o mouse */
-    color: #000000;  /* Preto */
-}
-QPushButton:pressed {
-    background-color: #40916C;   /* Verde pastel escuro ao clicar */
-    color: #000000;  /* Preto */
-}
-""")
-        run_btn_single.clicked.connect(self.salvar_mmpbsa_single)
-        button_layout.addWidget(run_btn_single, alignment=Qt.AlignCenter)
-
-        # Botão RUN centralizado
-        run_btn_all = QPushButton("RUN ALL")
-        run_btn_all.setFixedWidth(150)
-        run_btn_all.setStyleSheet("""
-QPushButton {
-    background-color: #B7E4C7;   /* Verde pastel claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #222;
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #74C69D;   /* Verde pastel médio ao passar o mouse */
-    color: #000000;  /* Preto */
-}
-QPushButton:pressed {
-    background-color: #40916C;   /* Verde pastel escuro ao clicar */
-    color: #000000;  /* Preto */
-}
-""")
-        run_btn_all.clicked.connect(self.salvar_mmpbsa_all)
-        button_layout.addWidget(run_btn_all, alignment=Qt.AlignCenter)        
-
-        back_form_btn = QPushButton("SHOW FORM")
-        back_form_btn.setFixedWidth(150)
-        back_form_btn.setStyleSheet("""
-QPushButton {
-    background-color: #FFFFFF;   /* Cinza claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #333333;   /* Borda cinza escuro */
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #CCCCCC;   /* Cinza médio ao passar o mouse */
-    color: #000000;
-}
-QPushButton:pressed {
-    background-color: #666666;   /* Cinza escuro ao clicar */
-    color: #000000;
-}
-""")
-        back_form_btn.clicked.connect(self.back_form_mmpbsa)
-        button_layout.addWidget(back_form_btn, alignment=Qt.AlignCenter)
-
-        back_status_btn = QPushButton("SHOW STATUS")
-        back_status_btn.setFixedWidth(150)
-        back_status_btn.setStyleSheet("""
-QPushButton {
-    background-color: #FFFFFF;   /* Cinza claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #333333;   /* Borda cinza escuro */
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #CCCCCC;   /* Cinza médio ao passar o mouse */
-    color: #000000;
-}
-QPushButton:pressed {
-    background-color: #666666;   /* Cinza escuro ao clicar */
-    color: #000000;
-}
-""")
-        back_status_btn.clicked.connect(self.back_status_mmpbsa)
-        button_layout.addWidget(back_status_btn, alignment=Qt.AlignCenter)
-
-        main_layout.addLayout(button_layout)
-
-        main_layout.addSpacing(10)
-        self.tab6.setLayout(main_layout)
-        
-    def init_tab7(self):
-        layout = QVBoxLayout()
-        
-        # Label centralizada
-        label_title = QLabel("Results Visualization")
-        label_title.setAlignment(Qt.AlignCenter)
-        label_title.setStyleSheet("font-size: 14pt; font-weight: bold;")
-        layout.addWidget(label_title)
-        layout.addSpacing(20)
-
-        # Duas colunas de opções
-        col_layout = QHBoxLayout()
-
-        # ---- Coluna Esquerda ----
-        left_col = QVBoxLayout()
-        
-        # Label e ComboBox de pasta RUN
-        label_run_folder = QLabel("Choose Run Folder:")
-        left_col.addWidget(label_run_folder)        
-        self.combo_run_folder = QComboBox()
-        self.combo_run_folder.addItems(self.old_run_folders)
-        left_col.addWidget(self.combo_run_folder)
-
-        # Label e ComboBox Step
-        label_step = QLabel("Choose the Step:")
-        left_col.addWidget(label_step)
-        self.combo_step = QComboBox()
-        self.combo_step.addItems(["Pre-production", "Post-production"])
-        left_col.addWidget(self.combo_step)
-
-        # Label e ComboBox de gráficos
-        label_chart = QLabel("Choose the result parameter:")
-        left_col.addWidget(label_chart)
-        self.combo_chart = QComboBox()
-        # Opções para pré-produção:
-        self.pre_prod_charts = [
-            "Potential Energy-Minimization", "Temperature-NVT", "Pressure-NPT", "Density-NPT"
-        ]
-        # Opções para pós-produção:
-        self.post_prod_charts = [
-            "RMSD", "RMSD Dist", "RMSF", "SASA", "HBONDs", "Center Of Mass", "Rgyration"
-        ]
-        self.combo_chart.addItems(self.pre_prod_charts)        
-        left_col.addWidget(self.combo_chart)       
-       
-        # ---- Coluna do Centro ----
-        center_col = QVBoxLayout()
-        # Label e ComboBox de grupo (apenas para pós-produção)
-        self.label_group = QLabel("Choose the index group:")
-        self.label_group1 = QLabel("Group 1:")
-        self.combo_group1 = QComboBox()
-        self.label_group2 = QLabel("Group 2:")
-        self.combo_group2 = QComboBox()
-        self.label_group.setEnabled(False)
-        self.label_group1.setEnabled(False)
-        self.label_group2.setEnabled(False)
-        self.combo_group1.setEnabled(False)
-        self.combo_group2.setEnabled(False)
-        center_col.addWidget(self.label_group)
-        center_col.addWidget(self.label_group1)
-        center_col.addWidget(self.combo_group1)
-        center_col.addWidget(self.label_group2)
-        center_col.addWidget(self.combo_group2)
-
-        # Caixas de seleção para legenda e média móvel e a caixa de texto ao lado
-        moving_avg_layout = QHBoxLayout()
-        self.check_legend = QCheckBox("Show Legend")
-        self.check_moving_avg = QCheckBox("Moving Average")
-        self.moving_avg_value = QLineEdit("20")
-        self.moving_avg_value.setPlaceholderText("Moving Average Value")
-        self.moving_avg_value.setFixedWidth(80)
-        self.check_legend.setChecked(False)
-        self.moving_avg_value.setEnabled(False)  # Inicialmente inativa
-        moving_avg_layout.addWidget(self.check_legend)
-        moving_avg_layout.addWidget(self.check_moving_avg)
-        moving_avg_layout.addWidget(self.moving_avg_value)
-        center_col.addLayout(moving_avg_layout)
-
-        # ----- Coluna da direita -----
-        right_col = QVBoxLayout()
-        self.chk_merge_charts = QCheckBox("Merge Charts")
-        self.btn_add_chart = QPushButton("Add Chart")
-        self.ed_chart_list = QPlainTextEdit()
-        self.ed_chart_list.setFixedSize(200, 140)
-        self.ed_chart_list.setPlaceholderText("Um ligante por linha…")
-
-        # >>> inicial: desabilitados
-        self.btn_add_chart.setEnabled(False)
-        self.ed_chart_list.setEnabled(False)
-
-        right_col.addWidget(self.chk_merge_charts, alignment=Qt.AlignCenter)
-        right_col.addWidget(self.btn_add_chart, alignment=Qt.AlignCenter)
-        right_col.addWidget(self.ed_chart_list, alignment=Qt.AlignCenter)
-
-        self.chk_merge_charts.toggled.connect(self._toggle_merge_controls)
-        self.btn_add_chart.clicked.connect(self.add_chart_to_list)
-
-        # Adiciona as três colunas ao layout principal:
-        col_layout.addLayout(left_col)
-        col_layout.setStretch(0, 1)  # left_col ocupa 1 parte
-        col_layout.addLayout(center_col)
-        col_layout.setStretch(1, 1)  # center_col ocupa 1 parte
-        col_layout.addLayout(right_col)
-        col_layout.setStretch(2, 1)  # right_col ocupa 1 parte
-
-        # Conecta o sinal para ativar/desativar a caixa de texto
-        self.check_moving_avg.stateChanged.connect(
-            lambda state: self.moving_avg_value.setEnabled(state == Qt.Checked)
-        )
-        
-        layout.addLayout(col_layout)
-        layout.addSpacing(15)
-
-        # ---- Status Viewer ----
-        self.status_view = QTextEdit()
-        self.status_view.setReadOnly(True)
-        self.status_view.setStyleSheet("background-color: #333; color: #fff; font-family: monospace;")
-        layout.addWidget(self.status_view)
-
-        # ---- Botões ----
-        button_row = QHBoxLayout()
-        btn_cancel = QPushButton("CANCELAR")
-        self.btn_view = QPushButton("VIEW")
-        btn_cancel.setFixedWidth(150)
-        self.btn_view.setFixedWidth(150)
-        btn_cancel.setStyleSheet("""
-        QPushButton {
-            background-color: #FFA07A;   /* Vermelho salmão claro */
-            color: #333333;              /* Cinza escuro */
-            font-size: 12pt;
-            font-weight: bold;
-            border: 1px solid #333333; /* Borda cinza escuro */
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #E9967A;   /* Vermelho salmão médio ao passar o mouse */
-            color: #000000;  /* Preto */
-        }
-        QPushButton:pressed {
-            background-color: #CD7054;   /* Vermelho salmão escuro ao clicar */
-            color: #000000;  /* Preto */
-        }
-        """)
-        self.btn_view.setStyleSheet("""
-QPushButton {
-    background-color: #B7E4C7;   /* Verde pastel claro */
-    color: #333333;              /* Cinza escuro */
-    font-size: 12pt;
-    font-weight: bold;
-    border: 1px solid #222;
-    border-radius: 4px;
-}
-QPushButton:hover {
-    background-color: #74C69D;   /* Verde pastel médio ao passar o mouse */
-    color: #000000;  /* Preto */
-}
-QPushButton:pressed {
-    background-color: #40916C;   /* Verde pastel escuro ao clicar */
-    color: #000000;  /* Preto */
-}
-""")
-        button_row.addWidget(btn_cancel, alignment=Qt.AlignLeft)
-        button_row.addStretch()
-        button_row.addWidget(self.btn_view, alignment=Qt.AlignRight)
-        layout.addLayout(button_row)
-
-        self.tab7.setLayout(layout)
-
-        # ---- LÓGICA DE ATUALIZAÇÃO DINÂMICA ----
-
-        # Quando o Step mudar, atualize as opções de chart e combo_group
-        def on_step_change(idx):
-            if idx == 0:  # Pre-production
-                self.combo_chart.clear()
-                self.combo_chart.addItems(self.pre_prod_charts)
-                self.label_group.setEnabled(False)
-                self.label_group1.setEnabled(False)
-                self.label_group2.setEnabled(False)
-                self.combo_group1.setEnabled(False)
-                self.combo_group2.setEnabled(False)
-            else:  # Post-production
-                self.combo_chart.clear()
-                self.combo_chart.addItems(self.post_prod_charts)
-                self.label_group.setEnabled(True)
-                self.label_group1.setEnabled(True)
-                self.label_group2.setEnabled(True)
-                self.combo_group1.setEnabled(True)
-                self.combo_group2.setEnabled(True)
-                # Carregar os grupos do arquivo index.ndx da pasta selecionada
-                self.update_group_combo()
-
-        self.combo_step.currentIndexChanged.connect(on_step_change)
-
-        def on_chart_change(idx):
-            chart_text = self.combo_chart.currentText()
-            if chart_text == "RMSD Dist" or chart_text == "RMSF" or chart_text == "Center Of Mass" or chart_text == "SASA" or chart_text == "Rgyration":
-                self.label_group2.setEnabled(False)
-                self.combo_group2.setEnabled(False)
-                self.label_group1.setEnabled(True)
-                self.combo_group1.setEnabled(True)
-            elif self.combo_step.currentIndex() == 1:  # Post-production
-                self.label_group1.setEnabled(True)
-                self.combo_group1.setEnabled(True)
-                self.label_group2.setEnabled(True)
-                self.combo_group2.setEnabled(True)
-            else:
-                self.label_group1.setEnabled(False)
-                self.combo_group1.setEnabled(False)
-                self.label_group2.setEnabled(False)
-                self.combo_group2.setEnabled(False)
-
-        self.combo_chart.currentIndexChanged.connect(on_chart_change)
-
-        # Atualizar grupos quando Run Folder muda
-        def on_run_folder_change(idx):
-            if self.combo_step.currentIndex() == 1:  # Só recarrega se for pós-produção
-                self.update_group_combo()
-        self.combo_run_folder.currentIndexChanged.connect(on_run_folder_change)
-
-        # Função para ler index.ndx e atualizar combo_group
-        def update_group_combo():
-            self.combo_group1.clear()
-            self.combo_group2.clear()
-            run_folder = self.combo_run_folder.currentText()
-            if not run_folder:
-                return
-            ndx_path = os.path.join(self.codyn_dir, "RUNS", run_folder, "index.ndx")
-            if os.path.exists(ndx_path):
-                with open(ndx_path) as f:
-                    lines = f.readlines()
-                groups = []
-                for line in lines:
-                    line = line.strip()
-                    if line.startswith('[') and line.endswith(']'):
-                        groups.append(line)
-                for idx, name in enumerate(groups):
-                    self.combo_group1.addItem(f"{idx} - {name}")
-                    self.combo_group2.addItem(f"{idx} - {name}")
-            else:
-                self.combo_group1.addItem("No index.ndx found")
-                self.combo_group2.addItem("No index.ndx found")
-        self.update_group_combo = update_group_combo
-
-        # STATUS e BOTÕES
-        btn_cancel.clicked.connect(lambda: self.status_view.clear())
-        btn_cancel.clicked.connect(self.cancel_all_processes)
-        self.btn_view.clicked.connect(self._on_view_clicked)
-
-    def log(self, message: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_status_view(f"[{ts}] {message}")
-
-    def _on_view_clicked(self):
-        if self.chk_merge_charts.isChecked():
+    def write(self, text):
+        for stream in (self._console, self._log):
+            if stream is None:
+                continue
             try:
-                self.generate_and_plot_multi_y_vs_x()
-            except Exception as e:
-                QMessageBox.warning(self, "Merge Charts", f"Falha ao gerar gráfico combinado:\n{e}")
-        else:
-            self.view_results()
+                stream.write(text)
+            except Exception:   # console com codificação limitada (cp1252) e emoji/acento no texto
+                try:
+                    stream.write(text.encode("ascii", "replace").decode("ascii"))
+                except Exception:
+                    pass
+        return len(text)
 
-    def generate_and_plot_multi_y_vs_x(self):
-        st = self.merge_state
-        if st["base_file"] is None or st["base_x"] is None or not st["y_series"]:
-            QMessageBox.information(self, "Merge Charts", "Add at least one .xvg to define X and Y (the first file).")
-            return
-        runs_path = os.path.join(self.codyn_dir, "RUNS")
-        os.makedirs(runs_path, exist_ok=True)
-        now = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        out_name = f"{now}_merge.xvg"
-        out_path = os.path.join(runs_path, out_name)
+    def flush(self):
+        for stream in (self._console, self._log):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except Exception:
+                pass
 
-        x = st["base_x"]
-        labels = [s["label"] for s in st["y_series"]]
-        y_list = [s["y"] for s in st["y_series"]]
+    def isatty(self):
+        return False
 
-        # garantir alinhamento por segurança
-        n = min([len(x)] + [len(y) for y in y_list])
-        x = x[:n]
-        y_list = [y[:n] for y in y_list]
+    encoding = "utf-8"
+    errors = "replace"
 
-        with open(out_path, "w") as f:
-            f.write(f"@ title \"Merged: X from {st['base_label']} with multiple Y series\"\n")
-            f.write("@ legend on\n")
-            f.write("@ xaxis label \"X (from first .xvg)\"\n")
-            f.write("@ yaxis label \"Y (from selected .xvg files)\"\n")
-            f.write(f"# COL0 = X from {st['base_label']}\n")
-            for i, lab in enumerate(labels, start=1):
-                f.write(f"# COL{i} = Y from {lab}\n")
-            for i in range(n):
-                row = [f"{x[i]:.6f}"] + [f"{y[i]:.6f}" for y in y_list]
-                f.write(" ".join(row) + "\n")
-            f.write("# End of merged file\n")
+    def writable(self):
+        return True
 
-        self.log_status_view(f"Merged file saved: {out_path}")
+    def fileno(self):
+        return self._log.fileno()   # quem pedir um descritor (subprocesso, faulthandler) recebe o log
 
-        from BIN.module_view import ViewWorker
-        vw = ViewWorker(
-            self.codyn_dir, run_folder="", step="", chart="",
-            use_moving_avg=self.check_moving_avg.isChecked(),
-            moving_avg_value=int(self.moving_avg_value.text() or 20) if self.moving_avg_value.isEnabled() else 20,
-            use_legend=self.check_legend.isChecked()
-        )
-        vw.log_view_signal.connect(self.log_status_view)
-        # >>> NOVO método de plot para X fixo + múltiplos Y <<<
-        vw.plot_multi_y_vs_x_from_file(out_path, labels, title="Merged chart (multiple Y vs X)")
 
-    def _toggle_merge_controls(self, checked: bool):
-        self.btn_add_chart.setEnabled(checked)
-        self.ed_chart_list.setEnabled(checked)
-        if not checked:
-            # limpamos o estado e a lista visual
-            self.merge_state = {"base_file": None, "base_x": None, "base_label": None, "y_series": []}
-            self.ed_chart_list.clear()
-
-    def add_chart_to_list(self):
+def _setup_terminal_log():
+    global _codyn_tee_proc
+    import glob
+    import subprocess
+    try:
+        os.makedirs(CODYN_TERMINAL_LOG_DIR, exist_ok=True)
+        for old in glob.glob(os.path.join(CODYN_TERMINAL_LOG_DIR, "terminal_*.log")):
+            try:
+                old_pid = int(os.path.basename(old)[len("terminal_"):-len(".log")])
+                if old_pid != os.getpid() and not _pu.pid_alive(old_pid):
+                    os.remove(old)
+            except ValueError:
+                os.remove(old)
+            except Exception:
+                pass
+        log_fd = os.open(CODYN_TERMINAL_LOG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    except OSError:
+        return
+    if _IS_WINDOWS:
+        # Sem fork/tee/dup2 de console: troca sys.stdout/sys.stderr. Aberto pelo atalho (pythonw.exe) não
+        # há console (sys.stdout é None) e tudo vai só para o log; rodando num terminal, a saída continua
+        # nele e é copiada para o log (Help > Terminal).
         try:
-            start_dir = os.path.join(self.codyn_dir, "RUNS")
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Select .xvg file", start_dir,
-                "XVG files (*.xvg);;All files (*.*)"
-            )
-            if not path:
-                return
-            if not os.path.isfile(path):
-                QMessageBox.warning(self, "Add Chart", f"File not found:\n{path}")
-                return
-
-            # parser simples 2 colunas (x,y)
-            def parse_xvg_2cols(fp):
-                xs, ys = [], []
-                with open(fp, "r") as f:
-                    for line in f:
-                        if line.startswith(("#", "@")):
-                            continue
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            xs.append(float(parts[0]))
-                            ys.append(float(parts[1]))
-                return xs, ys
-
-            xs, ys = parse_xvg_2cols(path)
-            if not xs or not ys:
-                QMessageBox.warning(self, "Add Chart", "The selected file has no valid numeric data (>= 2 columns).")
-                return
-
-            label = os.path.basename(path)
-
-            if self.merge_state["base_file"] is None:
-                # PRIMEIRO arquivo: define X fixo e já adiciona o Y inicial
-                self.merge_state["base_file"] = path
-                self.merge_state["base_x"] = xs
-                self.merge_state["base_label"] = label
-
-                # alinhar Y ao X (na prática já tem mesmo tamanho, mas garantimos)
-                n = min(len(xs), len(ys))
-                self.merge_state["base_x"] = xs[:n]
-                y0 = ys[:n]
-
-                self.merge_state["y_series"].append({"file": path, "label": label, "y": y0})
-                self.ed_chart_list.appendPlainText(f"[X+Y] {label}")
-                self.log_status_view(f"Base X set from: {label}; first Y series added.")
-            else:
-                # DEMAIS arquivos: só adicionam Y, alinhado ao X base
-                n = len(self.merge_state["base_x"])
-                yk = ys[:n]
-                if n == 0 or len(yk) == 0:
-                    QMessageBox.warning(self, "Add Chart", "Could not align series lengths with base X.")
-                    return
-                self.merge_state["y_series"].append({"file": path, "label": label, "y": yk})
-                self.ed_chart_list.appendPlainText(f"[Y] {label}")
-                self.log_status_view(f"Added Y series from: {label}")
-
-        except Exception as e:
-            QMessageBox.warning(self, "Add Chart", f"Failed to add item:\n{e}")
-
-    def view_results(self):
-        run_folder = self.combo_run_folder.currentText()
-        step = self.combo_step.currentText()
-        chart = self.combo_chart.currentText()
-        group_index1 = None
-        group_index2 = None
-        if step == "Post-production" and self.combo_group1.isEnabled():
-            group_index1 = self.combo_group1.currentIndex()
-        if step == "Post-production" and self.combo_group2.isEnabled():
-            group_index2 = self.combo_group2.currentIndex()
-        use_moving_avg = self.check_moving_avg.isChecked()
-        use_legend = self.check_legend.isChecked()
-        try:
-            moving_avg_value = int(self.moving_avg_value.text())
-        except ValueError:
-            moving_avg_value = 20  # valor padrão se não for inteiro
-
-        from BIN.module_view import ViewWorker
-        self.view_worker = ViewWorker(
-            self.codyn_dir, run_folder, step, chart,
-            group_index1, group_index2,
-            use_moving_avg, moving_avg_value, use_legend
-        )
-        self.view_worker.log_view_signal.connect(self.log_status_view)
-        self.view_worker.run()
-        
-    #Método para instalar dependências:
-    def show_requirements_installer(self):
-        self.req_win = RequirementsInstaller(None)
-        self.req_win.setWindowModality(Qt.ApplicationModal)
-        self.req_win.show()
-        self.req_win.activateWindow()
-        self.req_win.raise_()
-    
-    def update_progress_time(self, secs: int):
-        if secs is None or secs < 0:
-            # fallback para casos estranhos
-            self.progress_time.setFormat("Remaining Time: --:--:--")
-            return
-        h = secs // 3600
-        m = (secs % 3600) // 60
-        s = secs % 60
-        # mantém o valor, mas exibimos no texto formatado
-        self.progress_time.setValue(secs)
-        self.progress_time.setFormat(f"Remaining Time: {h:02d}:{m:02d}:{s:02d}")
-
-    def update_run_folders(self, all_run_folders):
-        self.combo_run_folder_mmpbsa.clear()
-        self.combo_run_folder_mmpbsa.addItems(all_run_folders)
-        self.combo_run_folder.clear()
-        self.combo_run_folder.addItems(all_run_folders)
-        # if all_run_folders:
-        #     self.combo_run_folder.setCurrentIndex(0)
-    # Método para cancelar todos os processos e voltar para a aba HOME
-    def cancel_all_processes(self):
-        reply = QMessageBox.question(
-            self,
-            "Attention",
-            "Do you really want to cancel all processes\n and return to the HOME tab?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            if hasattr(self, 'worker'):
-                self.worker.request_cancel()
-            self.tabs.setCurrentIndex(0)
-            # Mata todos os processos que começam com "gmx"
-            subprocess.run("pkill -9 -f '^gmx'", shell=True)
-            
-    def salvar_mmpbsa_single(self):
-        n_threads = int(self.n_threads.text())
-        run_folder = self.combo_run_folder_mmpbsa.currentText()        
-        if not run_folder:
-            QMessageBox.warning(self, "Attention!", "Please select a Run Folder.")
-            self.tabs.setCurrentIndex(6)
-            return
-
-        # Para cada pasta, obter o tempo de produção (t_ns_md) do arquivo md_0_*.xtc
-        run_folders = [os.path.join(self.codyn_dir, "RUNS", run_folder)]
-        t_ns_md_list = []
-        for run_folder in run_folders:
-            xtc_files = [f for f in os.listdir(run_folder) if f.startswith("md_0_") and f.endswith(".xtc")]
-            if xtc_files:
-                # Extrai o número entre md_0_ e .xtc
-                match = re.search(r"md_0_(\d+)\.xtc", xtc_files[0])
-                if match:
-                    t_ns_md = match.group(1)
-                    t_ns_md_list.append(t_ns_md)
-                else:
-                    t_ns_md_list.append("100")  # Valor padrão se não encontrar
-            else:
-                t_ns_md_list.append("100")  # Valor padrão se não encontrar
-        print(f"t_ns_md_list detectados: {t_ns_md_list}")
-
-        config_mmpbsa = {
-            "Run_Folder": self.combo_run_folder_mmpbsa.currentText(),
-            "force_field": self.ff.currentText().split('-')[0].strip(),
-            "n_threads": self.n_threads.text(),
-            "frame_start": self.frame_start.text(),
-            "frame_end": self.frame_end.text(),
-            "interval": self.interval.text(),
-            "verbose": self.verbose.text(),
-            "igb": self.igb.text(),
-            "sltcon": self.sltcon.text(),
-            "probe_radius": self.probe_radius.text(),
-            "istrng": self.istrng.text(),
-            "fill_ratio": self.fill_ratio.text(),
-            "idecomp": self.idecomp.text(),
-            "dec_verbose": self.dec_verbose.text(),
-        }
-
-        # Verifica se todos os campos estão preenchidos
-        if any(not item for item in config_mmpbsa.values()):
-            QMessageBox.warning(self, "Attention!", "There are empty MMPBSA configuration fields.")
-            self.tabs.setCurrentIndex(7)
-            return
-
-        # Formato do arquivo mmpbsa.in:
-        mmpbsa_in_content = f"""\
-# General namelist variables
-&general
-  # System name
-  sys_name             = "{config_mmpbsa['Run_Folder']}",
-  # First frame to analyze
-  startframe={config_mmpbsa['frame_start']},
-  # Last frame to analyze
-  endframe={config_mmpbsa['frame_end']},
-  interval={config_mmpbsa['interval']},
-  # How many energy terms to print in the final output
-  verbose={config_mmpbsa['verbose']},
-/
-# Generalized-Born namelist variables
-&gb
-  # GB model to use
-  igb={config_mmpbsa['igb']},
-  saltcon={config_mmpbsa['sltcon']},
-/
-#&pb
-#  istrng={config_mmpbsa['istrng']}, fillratio={config_mmpbsa['fill_ratio']},
-/
-&decomp
-idecomp={config_mmpbsa['idecomp']}, dec_verbose={config_mmpbsa['dec_verbose']},
-# This will print all residues that are less than 4 Å between
-# the receptor and the ligand
-#  print_res='Within 4',
-/
-"""
-
-        # Salva em cada run_folder
-        for run_folder in run_folders:
-            file_path = os.path.join(run_folder, "mmpbsa.in")
-            with open(file_path, "w") as f:
-                f.write(mmpbsa_in_content)
-
-        self.form_widget.hide()
-        self.status_mmpbsa.clear()
-        self.status_mmpbsa.show()
-        # 6. Executa MMPBSAWorker para cada pasta, usando o t_ns_md correspondente
-        # for worker in self.mmpbsa_workers:
-        #     worker.wait()
-        self.mmpbsa_workers.clear()  # Limpa lista antes de iniciar novos cálculos
-        worker = MMPBSAWorker(n_threads, t_ns_md_list, run_folders, params=config_mmpbsa)
-        worker.log_mmpbsa_signal.connect(self.log_status_mmpbsa)
-        worker.start()
-        self.mmpbsa_workers = [worker]
-        # self.mmpbsa_workers.append(worker)  # <-- GUARDA REFERÊNCIA!
-
-    def salvar_mmpbsa_all(self):
-        n_threads = int(self.n_threads.text())
-
-        # Obter subpastas em RUNS que NÃO possuem FINAL_RESULTS_MMPBSA.dat
-        runs_dir = os.path.join(self.codyn_dir, "RUNS")
-        run_folders = [
-            os.path.join(runs_dir, d)
-            for d in os.listdir(runs_dir)
-            if os.path.isdir(os.path.join(runs_dir, d)) and
-            not os.path.exists(os.path.join(runs_dir, d, "FINAL_RESULTS_MMPBSA.dat"))
-        ]
-        print(f"run_folders detectadas: {run_folders}")
-
-        # Para cada pasta, obter o tempo de produção (t_ns_md) do arquivo md_0_*.xtc
-        t_ns_md_list = []
-        for run_folder in run_folders:
-            xtc_files = [f for f in os.listdir(run_folder) if f.startswith("md_0_") and f.endswith(".xtc")]
-            if xtc_files:
-                # Extrai o número entre md_0_ e .xtc
-                match = re.search(r"md_0_(\d+)\.xtc", xtc_files[0])
-                if match:
-                    t_ns_md = match.group(1)
-                    t_ns_md_list.append(t_ns_md)
-                else:
-                    t_ns_md_list.append("100")  # Valor padrão se não encontrar
-            else:
-                t_ns_md_list.append("100")  # Valor padrão se não encontrar
-        print(f"t_ns_md_list detectados: {t_ns_md_list}")
-
-        config_mmpbsa = {
-            "force_field": self.ff.currentText().split('-')[0].strip(),
-            "n_threads": self.n_threads.text(),
-            "frame_start": self.frame_start.text(),
-            "frame_end": self.frame_end.text(),
-            "interval": self.interval.text(),
-            "verbose": self.verbose.text(),
-            "igb": self.igb.text(),
-            "sltcon": self.sltcon.text(),
-            "probe_radius": self.probe_radius.text(),
-            "istrng": self.istrng.text(),
-            "fill_ratio": self.fill_ratio.text(),
-            "idecomp": self.idecomp.text(),
-            "dec_verbose": self.dec_verbose.text(),
-        }
-
-        # Verifica se todos os campos estão preenchidos
-        if any(not item for item in config_mmpbsa.values()):
-            QMessageBox.warning(self, "Attention!", "There are empty MMPBSA configuration fields.")
-            self.tabs.setCurrentIndex(7)
-            return
-
-        # Formato do arquivo mmpbsa.in:
-        mmpbsa_in_content = f"""\
-# General namelist variables
-&general
-  # System name
-  sys_name             = "Proteina-ligante"
-  # First frame to analyze
-  startframe={config_mmpbsa['frame_start']},
-  # Last frame to analyze
-  endframe={config_mmpbsa['frame_end']},
-  interval={config_mmpbsa['interval']},
-  # How many energy terms to print in the final output
-  verbose={config_mmpbsa['verbose']},
-/
-# Generalized-Born namelist variables
-&gb
-  # GB model to use
-  igb={config_mmpbsa['igb']},
-  saltcon={config_mmpbsa['sltcon']},
-/
-#&pb
-#  istrng={config_mmpbsa['istrng']}, fillratio={config_mmpbsa['fill_ratio']},
-/
-&decomp
-idecomp={config_mmpbsa['idecomp']}, dec_verbose={config_mmpbsa['dec_verbose']},
-# This will print all residues that are less than 4 Å between
-# the receptor and the ligand
-#  print_res='Within 4',
-/
-"""
-
-        # Salva em cada run_folder
-        for run_folder in run_folders:
-            file_path = os.path.join(run_folder, "mmpbsa.in")
-            with open(file_path, "w") as f:
-                f.write(mmpbsa_in_content)
-
-        self.form_widget.hide()
-        self.status_mmpbsa.clear()
-        self.status_mmpbsa.show()
-        # 6. Executa MMPBSAWorker para cada pasta, usando o t_ns_md correspondente
-        # for worker in self.mmpbsa_workers:
-        #     worker.wait()
-        self.mmpbsa_workers.clear()  # Limpa lista antes de iniciar novos cálculos
-        worker = MMPBSAWorker(n_threads, t_ns_md_list, run_folders, params=config_mmpbsa)
-        worker.log_mmpbsa_signal.connect(self.log_status_mmpbsa)
-        worker.start()
-        self.mmpbsa_workers = [worker]
-        # self.mmpbsa_workers.append(worker)  # <-- GUARDA REFERÊNCIA!
-
-    def back_form_mmpbsa(self):
-        self.status_mmpbsa.hide()
-        self.form_widget.show()
-
-    def back_status_mmpbsa(self):
-        self.form_widget.hide()
-        self.status_mmpbsa.show()
-
-    def show_alert(self, title, message):
-        QMessageBox.information(self, title, message)
-
-    def log_status_lig(self, message):
-        self.status_lig.append(message)
-        self.status_lig.verticalScrollBar().setValue(self.status_lig.verticalScrollBar().maximum())
-
-    def log_status_prot(self, message):
-        # Exibe no QTextEdit ou, se necessário, chama QMessageBox
-        if message.startswith("Attention!"):
-            QMessageBox.warning(self, "Attention!", message[9:])
+            log_file = os.fdopen(log_fd, "w", encoding="utf-8", errors="replace", buffering=1)
+            console = sys.stdout if (sys.stdout is not None and sys.stdout.isatty()) else None
+            sys.stdout = sys.stderr = _TeeStream(console, log_file)
+        except Exception:
+            pass
+        return
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if os.isatty(1):
+            os.close(log_fd)
+            _codyn_tee_proc = subprocess.Popen(["tee", "-i", "-a", CODYN_TERMINAL_LOG], stdin=subprocess.PIPE)
+            out_fd = _codyn_tee_proc.stdin.fileno()
         else:
-            self.status_prot.append(message)
-            self.status_prot.verticalScrollBar().setValue(self.status_prot.verticalScrollBar().maximum())
-
-    def log_status_cell(self, message):
-        self.status_cell.append(message)
-        self.status_cell.verticalScrollBar().setValue(self.status_cell.verticalScrollBar().maximum())
-
-    def log_status_eq(self, message):
-        self.status_eq.append(message)
-        self.status_eq.verticalScrollBar().setValue(self.status_eq.verticalScrollBar().maximum())
-
-    def log_status_md(self, message):
-        self.status_prod.append(message)
-        self.status_prod.verticalScrollBar().setValue(self.status_prod.verticalScrollBar().maximum())
-
-    def log_status_mmpbsa(self, message):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.status_mmpbsa.append(f"{ts} {message}")
-        self.status_mmpbsa.verticalScrollBar().setValue(self.status_mmpbsa.verticalScrollBar().maximum())
-    
-    def log_status_view(self, message):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.status_view.append(f"{ts} {message}")
-        self.status_view.verticalScrollBar().setValue(self.status_view.verticalScrollBar().maximum())
-
-    def start_config_run_thread(self, run_folders_info):
-        self.worker = RunWorkerThread(
-            self.tabs,
-            self.tab_config,
-            self.codyn_dir,
-            run_folders_info,
-            self.tab_config.lig_dir.text(),
-            self.tab_config.prot_dir.text()
-        )
-        self.worker.alert_signal.connect(self.show_alert, Qt.BlockingQueuedConnection)
-        self.worker.log_prot_signal.connect(self.log_status_prot)
-        self.worker.log_cell_signal.connect(self.log_status_cell)
-        self.worker.log_eq_signal.connect(self.log_status_eq)
-        self.worker.log_md_signal.connect(self.log_status_md)
-        self.worker.log_progress_step_signal.connect(self.progress_step.setValue)
-        self.worker.log_progress_stepmax_signal.connect(self.progress_step.setMaximum)
-        self.worker.log_progress_time_signal.connect(self.update_progress_time)
-        self.worker.update_run_folders_signal.connect(self.update_run_folders)
-        self.worker.log_lig_signal.connect(self.log_status_lig)
-        self.worker.update_tab_signal.connect(self.tabs.setCurrentIndex)
-        self.worker.finished_signal.connect(lambda _: QMessageBox.information(self, "Concluído", "Dinâmica finalizada!"))
-        self.worker.start()
-
-    def closeEvent(self, event):
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.request_cancel()
-            self.worker.wait()
-        event.accept()
-
-    def show_about(self):
-        QMessageBox.about(
-            self,
-            "ABOUT US",
-            "                          An Open Source\n"
-            "Automated Molecular Dynamics Tool\n"
-            "\nDeveloped by:\n"
-            "   Ahmad Kassein El Zein\n"
-            "   Bernardo Mussa\n"
-            "   Gustavo Henrique Scheiffer\n"
-            "   Moisés Maia Neto\n"
-            "   Roberto Pontarolo\n"
-            "   Raul Edison Luna Lazo\n"            
-            "   Universidade Federal do Paraná (UFPR)\n"
-            "   Brazil\n"
-            "\nContact:\n"
-            "   moimaian@gmail.com\n"
-            "\n           Version 1.0   © July-2025\n"
-        )
+            out_fd = log_fd
+        os.dup2(out_fd, 1)
+        os.dup2(out_fd, 2)
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    codyn_dir = os.path.abspath(os.path.dirname(__file__))
+    _bootstrap_codyn_venv()
+    _setup_terminal_log()
 
-    splash = SplashScreen(codyn_dir)
+import shlex
+import shutil
+import subprocess
+import webbrowser
+
+from PyQt5.QtCore import QSettings, QSize, Qt, QTimer, QUrl
+from PyQt5.QtGui import QDesktopServices, QGuiApplication, QIcon
+from PyQt5.QtWidgets import (
+    QAction, QApplication, QComboBox, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget, QAbstractItemView,
+)
+
+from BIN import i18n
+from BIN.config_form import ConfigForm
+from BIN.dialogs import CgenffDialog
+from BIN.module_home import HomeTab
+from BIN.module_requirements import RequirementsInstaller, missing_required_python
+from BIN.module_results import ResultsTab, list_run_folders
+from BIN.projects import ProjectManager, migrate_legacy
+from BIN.pipeline import MMPBSAWorker, PipelineWorker, find_production_tag
+from BIN.runconfig import RunConfig
+from BIN.splash_screen import SplashScreen
+from BIN.theme import PALETTE, SS_MAIN, ensure_button_fits, set_role
+from BIN.tools import CancelToken
+from BIN.versao import VERSAO
+from BIN.widgets import CollapsibleGroupBox, LogConsole, make_progress, make_title
+
+GITHUB_URL = "https://github.com/moimaian/CODYN"
+
+# (índice da aba, chave do passo, chave i18n do título, com barra de progresso)
+STEP_TABS = [
+    (2, "lig", "step1_title", False),
+    (3, "prot", "step2_title", False),
+    (4, "cell", "step3_title", True),
+    (5, "eq", "step4_title", True),
+    (6, "md", "step5_title", True),
+]
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, status=None):
+        super().__init__()
+        self.codyn_dir = CODYN_DIR
+        self.status = status or {}
+        self.settings = QSettings("CODYN", "CODYN")
+        self.project = ProjectManager(self.codyn_dir, self)
+        try:  # estrutura antiga (RUNS/ na raiz) -> projeto PROJECTS/<data>_RUNS_ANTERIORES
+            self._migration = migrate_legacy(self.codyn_dir)
+        except OSError as e:
+            self._migration = None
+            print(f"[CODYN] legacy RUNS migration failed: {e}", flush=True)
+        lang = self.settings.value("language", "") or i18n.detect_system_language()
+        self.tr_ = i18n.Translator(lang if lang in i18n.LANGUAGES else i18n.DEFAULT_LANGUAGE)
+        self.worker = None
+        self.mmpbsa_worker = None
+        self.token = CancelToken()
+        self.consoles = {}
+        self.bars = {}
+        self.remaining = {}
+        self._req_dialog = None
+        self._runs_status = {}
+
+        self.tr_.on_change(lambda _l: self._update_title())
+        self._update_title()
+        self.setWindowIcon(QIcon(os.path.join(self.codyn_dir, "ICONS", "LOGO_CODYN.png")))
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        w, h = min(1180, int(screen.width() * 0.8)), min(860, int(screen.height() * 0.9))
+        self.resize(w, h)
+        self.move(screen.x() + (screen.width() - w) // 2, screen.y() + (screen.height() - h) // 2)
+
+        self._build_menu()
+        self._build_corner()
+        self._build_tabs()
+        self.tr_.on_change(lambda _l: self._after_language_change())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self._fit_to_home)  # caso os dados da HOME tenham chegado antes da janela aparecer
+
+    def _fit_to_home(self, attempt=0):
+        """Na primeira carga da HOME, ajusta a janela para que todo o conteúdo apareça sem rolagem
+        (limitado à área útil da tela). Atualizações posteriores não mexem no tamanho escolhido pelo usuário.
+        Mede de novo após o layout assentar (até 3 passadas), pois os dados chegam de forma assíncrona."""
+        if getattr(self, "_home_fitted", False) or not self.isVisible() or not self.home._info:
+            return
+        if attempt == 0:
+            QTimer.singleShot(150, lambda: self._fit_to_home(1))
+            return
+        dw, dh = self.home.extra_size()
+        if (dw or dh) and attempt <= 3:
+            screen = QGuiApplication.primaryScreen().availableGeometry()
+            w = min(self.width() + dw, screen.width())
+            h = min(self.height() + dh, screen.height())
+            if (w, h) != (self.width(), self.height()):
+                self.resize(w, h)
+                fg = self.frameGeometry()
+                x = min(max(screen.x(), fg.x()), screen.right() - fg.width() + 1)
+                y = min(max(screen.y(), fg.y()), screen.bottom() - fg.height() + 1)
+                self.move(x, y)
+                QTimer.singleShot(150, lambda: self._fit_to_home(attempt + 1))
+                return
+        self._home_fitted = True
+
+    # ------------------------------------------------------------------ menus ------------------------------------------------------------------
+    def _action(self, menu, key, slot):
+        act = QAction(self)
+        self.tr_.tr(key, act.setText)
+        act.triggered.connect(slot)
+        menu.addAction(act)
+        return act
+
+    def _build_menu(self):
+        bar = self.menuBar()
+        m = bar.addMenu("Menu")
+        self._action(m, "menu_new_run", lambda: self.tabs.setCurrentIndex(1))
+        for idx, key in ((2, "menu_step1"), (3, "menu_step2"), (4, "menu_step3"), (5, "menu_step4"),
+                         (6, "menu_step5"), (7, "menu_step6"), (8, "menu_results")):
+            self._action(m, key, lambda _=False, i=idx: self.tabs.setCurrentIndex(i))
+        m.addSeparator()
+        self._action(m, "menu_exit", self.close)
+        h = bar.addMenu("")
+        self.tr_.tr("menu_help", h.setTitle)
+        self._action(h, "menu_install", self.show_requirements_installer)
+        self._action(h, "menu_terminal", self.open_terminal_window)
+        self._action(h, "menu_docs", lambda: webbrowser.open(GITHUB_URL))
+        self._action(bar, "menu_about", self.show_about)  # direto na barra, fora do menu Ajuda
+
+    def _build_corner(self):
+        box = QWidget()
+        box.setStyleSheet("background:transparent;")
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 4, 0)
+        lay.setSpacing(6)
+        flag_style = ("QPushButton{border:none;background:transparent;padding:0;}"
+                      "QPushButton:hover{background:#16283B;border-radius:4px;}")
+        self.flags = {}
+        for lang, svg, tip in (("pt", "flag_br.svg", "tooltip_flag_pt"), ("en", "flag_gb.svg", "tooltip_flag_en")):
+            b = QPushButton()
+            b.setIcon(QIcon(os.path.join(self.codyn_dir, "ICONS", svg)))
+            b.setIconSize(QSize(24, 16))
+            b.setFlat(True)
+            b.setFixedSize(30, 22)
+            b.setStyleSheet(flag_style)
+            self.tr_.tr(tip, b.setToolTip)
+            b.clicked.connect(lambda _=False, l=lang: self.set_language(l))
+            lay.addWidget(b)
+            self.flags[lang] = b
+        self.btn_monitor = QPushButton()
+        self.tr_.tr("btn_monitor", self.btn_monitor.setText)
+        self.btn_monitor.setStyleSheet(
+            f"QPushButton{{padding:4px 12px;border:2px solid {PALETTE['muted']};border-radius:6px;background:{PALETTE['bg']};"
+            f"color:{PALETTE['muted']};font-weight:bold;font-size:9pt;}}QPushButton:hover{{background:#16283B;}}")
+        self.btn_monitor.clicked.connect(self.open_hw_monitor_window)
+        lay.addWidget(self.btn_monitor)
+        self.menuBar().setCornerWidget(box, Qt.TopRightCorner)
+        self._refresh_flags()
+
+    def _refresh_flags(self):
+        for lang, b in self.flags.items():
+            on = lang == self.tr_.lang
+            b.setStyleSheet(
+                "QPushButton{border:none;background:%s;padding:0;border-radius:4px;}"
+                "QPushButton:hover{background:#16283B;border-radius:4px;}" % ("#1C3249" if on else "transparent"))
+
+    def set_language(self, lang: str):
+        self.settings.setValue("language", lang)
+        self.tr_.set_language(lang)
+
+    def _after_language_change(self):
+        self._refresh_flags()
+        for w in self.findChildren(QPushButton):
+            ensure_button_fits(w)
+        for i, key in enumerate(("tab_home", "tab_config", "tab_step1", "tab_step2", "tab_step3", "tab_step4",
+                                 "tab_step5", "tab_step6", "tab_results")):
+            self.tabs.setTabText(i, self.tr_.t(key))
+        self.tabs.tabBar().updateGeometry()
+
+    # ------------------------------------------------------------------ abas ------------------------------------------------------------------
+    def _build_tabs(self):
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("main_tabs")
+        self.tabs.tabBar().setExpanding(True)
+        _f = self.tabs.tabBar().font(); _f.setBold(True)   # o QSS usa negrito: sem isto o tamanho das abas é medido sem negrito e "RESULTADOS" é cortado
+        self.tabs.tabBar().setFont(_f)
+        self.setCentralWidget(self.tabs)
+
+        self.home = HomeTab(self.codyn_dir, self.tr_)
+        self.home.start_requested.connect(lambda: self.tabs.setCurrentIndex(1))
+        self.home.install_requested.connect(self.show_requirements_installer)
+        self.home.content_ready.connect(self._fit_to_home)
+        self.config = ConfigForm(self.codyn_dir, self.tr_, self.project)
+        self.config.cancel_requested.connect(lambda: self.tabs.setCurrentIndex(0))
+        self.config.install_requested.connect(self.show_requirements_installer)
+        self.config.run_requested.connect(self.start_run)
+        self.tabs.addTab(self.home, "")
+        self.tabs.addTab(self.config, "")
+        for idx, key, title_key, with_progress in STEP_TABS:
+            self.tabs.addTab(self._make_step_tab(key, title_key, with_progress), "")
+        self.tabs.addTab(self._make_mmpbsa_tab(), "")
+        self.results = ResultsTab(self.project, self.tr_)
+        self.results.install_requested.connect(self.show_requirements_installer)
+        self.tabs.addTab(self.results, "")
+        self.project.changed.connect(self._on_project_changed)
+        self._after_language_change()
+        self._restore_project()
+
+    def _restore_project(self):
+        """Reabre o último projeto usado; logo após uma migração abre o projeto migrado (histórico antigo)."""
+        name = self.settings.value("last_project", "") or ""
+        path = os.path.join(self.codyn_dir, "PROJECTS", name) if name else ""
+        if self._migration and not os.path.isdir(path):
+            path = self._migration[0]
+        if path and os.path.isdir(path):
+            self.project.open(path)
+
+    def _on_project_changed(self, path: str):
+        if path:
+            self.settings.setValue("last_project", os.path.basename(path))
+        self.results.refresh_runs()
+        self.refresh_mmpbsa_runs()
+        self._update_title()
+
+    def _update_title(self):
+        title = self.tr_.t("app_title")
+        self.setWindowTitle(f"{title}  —  {self.project.name}" if self.project.is_open else title)
+
+    def _version_label(self):
+        lbl = QLabel(f"v{VERSAO}")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet(f"font-size:8pt;color:{PALETTE['muted']};")
+        return lbl
+
+    def _make_step_tab(self, key: str, title_key: str, with_progress: bool) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(16, 12, 16, 12)
+        title = make_title()
+        self.tr_.tr(title_key, title.setText)
+        lay.addWidget(title)
+
+        if key == "lig":
+            self.runs_table = QTableWidget(0, 3)
+            self.runs_table.setMaximumHeight(150)
+            self.runs_table.verticalHeader().setVisible(False)
+            self.runs_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            self.runs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.runs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.runs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.runs_table.cellDoubleClicked.connect(self._open_run_row)
+            self.tr_.on_change(lambda _l: self._retitle_runs_table())
+            self._retitle_runs_table()
+            lay.addWidget(self.runs_table)
+
+        console = LogConsole()
+        self.consoles[key] = console
+        lay.addWidget(console, 1)
+
+        if with_progress:
+            row = QHBoxLayout()
+            bar = make_progress("%v / %m")
+            lbl = QLabel()
+            lbl.setMinimumWidth(240)
+            self.tr_.tr("lbl_remaining_unknown", lbl.setText)
+            self.bars[key] = bar
+            self.remaining[key] = lbl
+            row.addWidget(bar, 4)
+            row.addWidget(lbl, 1)
+            lay.addLayout(row)
+
+        row = QHBoxLayout()
+        btn_cancel = QPushButton(); set_role(btn_cancel, "danger"); btn_cancel.setFixedWidth(160)
+        self.tr_.tr("btn_cancel", btn_cancel.setText)
+        btn_cancel.clicked.connect(self.cancel_all)
+        row.addStretch()
+        row.addWidget(btn_cancel)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addWidget(self._version_label())
+        return tab
+
+    def _retitle_runs_table(self):
+        self.runs_table.setHorizontalHeaderLabels([self.tr_.t("runs_col_folder"), self.tr_.t("runs_col_ligand"),
+                                                   self.tr_.t("runs_col_status")])
+
+    def _open_run_row(self, row, _col):
+        item = self.runs_table.item(row, 0)
+        if item:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(item.data(Qt.UserRole)))
+
+    def _set_run_status(self, folder: str, text: str):
+        for r in range(self.runs_table.rowCount()):
+            if self.runs_table.item(r, 0).data(Qt.UserRole) == folder:
+                self.runs_table.setItem(r, 2, QTableWidgetItem(text))
+                return
+
+    # ------------------------------------------------------------------ STEP 6 (MM/PBSA) ------------------------------------------------------------------
+    def _make_mmpbsa_tab(self) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(16, 12, 16, 12)
+        title = make_title()
+        self.tr_.tr("step6_title", title.setText)
+        lay.addWidget(title)
+
+        grp = CollapsibleGroupBox()
+        self.tr_.tr("mm_grp_params", grp.setTitle)
+        grid = QGridLayout(grp)
+        grid.setContentsMargins(14, 18, 14, 12)
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(10)
+        self.mm_run = QComboBox()
+        self.mm_refresh = QPushButton("⟳"); self.mm_refresh.setFixedWidth(36); set_role(self.mm_refresh, "secondary")
+        row = QHBoxLayout(); row.addWidget(self.mm_run, 1); row.addWidget(self.mm_refresh)
+        self.mm_fields = {
+            "n_threads": QSpinBox(), "frame_start": QSpinBox(), "frame_end": QSpinBox(), "interval": QSpinBox(),
+            "verbose": QSpinBox(), "igb": QSpinBox(), "sltcon": QLineEdit("0.15"),
+            "idecomp": QSpinBox(), "dec_verbose": QSpinBox(),
+        }
+        f = self.mm_fields
+        f["n_threads"].setRange(1, 256); f["n_threads"].setValue(max(1, (os.cpu_count() or 2) // 2))
+        f["frame_start"].setRange(1, 10_000_000); f["frame_start"].setValue(1)
+        f["frame_end"].setRange(1, 10_000_000); f["frame_end"].setValue(2000)
+        f["interval"].setRange(1, 100000); f["interval"].setValue(1)
+        f["verbose"].setRange(0, 3); f["verbose"].setValue(2)
+        f["igb"].setRange(1, 8); f["igb"].setValue(5)
+        f["idecomp"].setRange(0, 4); f["idecomp"].setValue(2)
+        f["dec_verbose"].setRange(0, 3); f["dec_verbose"].setValue(3)
+        # linha 0: pasta da execução (largura toda); abaixo, os 9 parâmetros em 3 colunas × 3 linhas,
+        # cada par rótulo+campo ocupando um terço da largura
+        lbl = QLabel(); self.tr_.tr("mm_run", lbl.setText)
+        top = QHBoxLayout(); top.setSpacing(10); top.addWidget(lbl); top.addLayout(row, 1)
+        grid.addLayout(top, 0, 0, 1, 3)
+        for i, (key, w) in enumerate(f.items()):
+            l = QLabel(); self.tr_.tr(f"mm_{key}", l.setText)
+            cell = QHBoxLayout(); cell.setSpacing(8)
+            cell.addWidget(l); cell.addWidget(w, 1)
+            grid.addLayout(cell, 1 + i // 3, i % 3)
+        for c in range(3):
+            grid.setColumnStretch(c, 1)
+            grid.setColumnMinimumWidth(c, 0)
+        lay.addWidget(grp)
+
+        self.mm_console = LogConsole()
+        lay.addWidget(self.mm_console, 1)
+
+        btns = QHBoxLayout()
+        self.mm_cancel = QPushButton(); set_role(self.mm_cancel, "danger"); self.mm_cancel.setFixedWidth(150)
+        self.mm_single = QPushButton(); set_role(self.mm_single, "primary"); self.mm_single.setFixedWidth(170)
+        self.mm_all = QPushButton(); set_role(self.mm_all, "primary"); self.mm_all.setFixedWidth(190)
+        self.tr_.tr("btn_cancel", self.mm_cancel.setText)
+        self.tr_.tr("mm_btn_single", self.mm_single.setText)
+        self.tr_.tr("mm_btn_all", self.mm_all.setText)
+        btns.addWidget(self.mm_cancel); btns.addStretch(); btns.addWidget(self.mm_single); btns.addWidget(self.mm_all)
+        lay.addLayout(btns)
+        lay.addWidget(self._version_label())
+        self.mm_cancel.clicked.connect(self.cancel_mmpbsa)
+        self.mm_single.clicked.connect(lambda: self.run_mmpbsa(all_pending=False))
+        self.mm_all.clicked.connect(lambda: self.run_mmpbsa(all_pending=True))
+        self.mm_refresh.clicked.connect(self.refresh_mmpbsa_runs)
+        self.refresh_mmpbsa_runs()
+        return tab
+
+    def refresh_mmpbsa_runs(self):
+        cur = self.mm_run.currentText()
+        self.mm_run.clear()
+        runs_dir = self.project.runs_dir
+        self.mm_run.addItems([d for d in list_run_folders(runs_dir)
+                              if find_production_tag(os.path.join(runs_dir, d))])
+        i = self.mm_run.findText(cur)
+        if i >= 0:
+            self.mm_run.setCurrentIndex(i)
+
+    def run_mmpbsa(self, all_pending: bool):
+        if self.mmpbsa_worker is not None and self.mmpbsa_worker.isRunning():
+            return
+        runs_dir = self.project.runs_dir
+        if all_pending:
+            folders = [os.path.join(runs_dir, d) for d in list_run_folders(runs_dir)
+                       if find_production_tag(os.path.join(runs_dir, d))
+                       and not os.path.exists(os.path.join(runs_dir, d, "FINAL_RESULTS_MMPBSA.dat"))]
+        else:
+            name = self.mm_run.currentText()
+            folders = [os.path.join(runs_dir, name)] if name else []
+        if not folders:
+            QMessageBox.information(self, self.tr_.t("msg_attention"), self.tr_.t("mm_nothing"))
+            return
+        f = self.mm_fields
+        params = {
+            "frame_start": f["frame_start"].value(), "frame_end": f["frame_end"].value(),
+            "interval": f["interval"].value(), "verbose": f["verbose"].value(), "igb": f["igb"].value(),
+            "sltcon": f["sltcon"].text().strip() or "0.15", "istrng": 0.15, "fill_ratio": 4.0,
+            "idecomp": f["idecomp"].value(), "dec_verbose": f["dec_verbose"].value(),
+        }
+        self.token = CancelToken()
+        self.mm_console.clear()
+        self.mm_console.log(self.tr_.t("mm_starting", n=len(folders)), stamp=True)
+        self.mmpbsa_worker = MMPBSAWorker(folders, params, f["n_threads"].value(), self.token, self)
+        self.mmpbsa_worker.log_signal.connect(lambda m: self.mm_console.log(m, stamp=True))
+        self.mmpbsa_worker.finished_signal.connect(self._mmpbsa_finished)
+        self.mm_single.setEnabled(False)
+        self.mm_all.setEnabled(False)
+        self.mmpbsa_worker.start()
+
+    def _mmpbsa_finished(self, ok: bool):
+        self.mm_single.setEnabled(True)
+        self.mm_all.setEnabled(True)
+        self.mm_console.log(self.tr_.t("mm_done_ok" if ok else "mm_done_fail"), stamp=True)
+        if ok:
+            self.tabs.setCurrentIndex(8)
+
+    def cancel_mmpbsa(self):
+        if self.mmpbsa_worker is not None and self.mmpbsa_worker.isRunning():
+            self.token.cancel()
+
+    # ------------------------------------------------------------------ execução do pipeline ------------------------------------------------------------------
+    def start_run(self, cfg: RunConfig, infos: list):
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, self.tr_.t("msg_attention"), self.tr_.t("run_busy"))
+            return
+        for c in self.consoles.values():
+            c.clear()
+        for key in self.bars:
+            self.bars[key].setMaximum(1)
+            self.bars[key].setValue(0)
+            self.tr_.tr("lbl_remaining_unknown", self.remaining[key].setText)
+        self.runs_table.setRowCount(len(infos))
+        for r, info in enumerate(infos):
+            it = QTableWidgetItem(os.path.basename(info["run_folder"]))
+            it.setData(Qt.UserRole, info["run_folder"])
+            self.runs_table.setItem(r, 0, it)
+            self.runs_table.setItem(r, 1, QTableWidgetItem(info["lig_name"]))
+            self.runs_table.setItem(r, 2, QTableWidgetItem(self.tr_.t("runs_status_waiting")))
+        self._runs_status = {i["run_folder"]: "run" for i in infos}
+        self.token = CancelToken()
+        self.worker = PipelineWorker(self.codyn_dir, cfg, infos, self.token, self)
+        self.worker.log_signal.connect(self._on_log)
+        self.worker.stage_signal.connect(self._on_stage)
+        self.worker.progress_signal.connect(self._on_progress)
+        self.worker.request_file_signal.connect(self._on_request_file)
+        self.worker.run_done_signal.connect(self._on_run_done)
+        self.worker.finished_signal.connect(self._on_finished)
+        self.config.btn_run.setEnabled(False)
+        self.tabs.setCurrentIndex(2)
+        self.worker.start()
+
+    def _on_log(self, step: str, msg: str):
+        c = self.consoles.get(step)
+        if c is not None:
+            c.log(msg)
+
+    def _on_stage(self, idx: int):
+        if idx <= 7:
+            self.tabs.setCurrentIndex(idx)
+        label_key = {2: "runs_status_lig", 3: "runs_status_prot", 4: "runs_status_cell", 5: "runs_status_eq",
+                     6: "runs_status_md"}.get(idx)
+        if label_key:
+            for folder, st in self._runs_status.items():
+                if st == "run":
+                    self._set_run_status(folder, self.tr_.t(label_key))
+
+    def _on_progress(self, step: str, cur: int, total: int, remaining: int):
+        bar = self.bars.get(step)
+        if bar is None:
+            return
+        bar.setMaximum(max(total, 1))
+        bar.setValue(min(cur, max(total, 1)))
+        if remaining >= 0:
+            h, rem = divmod(remaining, 3600)
+            m, s = divmod(rem, 60)
+            self.remaining[step].setText(self.tr_.t("lbl_remaining", t=f"{h:02d}:{m:02d}:{s:02d}"))
+
+    def _on_request_file(self, req: dict):
+        """Chamado na thread da GUI: o pipeline fica bloqueado até o usuário responder."""
+        try:
+            if req.get("kind") == "cgenff_str":
+                self.tabs.setCurrentIndex(2)
+                dlg = CgenffDialog(req, self.tr_, self)
+                dlg.exec_()
+                req["result"]["path"] = dlg.result_path
+        finally:
+            req["event"].set()
+
+    def _on_run_done(self, folder: str, ok: bool, msg: str):
+        self._runs_status[folder] = "ok" if ok else "failed"
+        self._set_run_status(folder, self.tr_.t("runs_status_done") if ok else self.tr_.t("runs_status_failed", msg=msg))
+
+    def _on_finished(self, ok: bool, failed: list):
+        self.config.btn_run.setEnabled(True)
+        self.results.refresh_runs()
+        self.refresh_mmpbsa_runs()
+        if self.token.is_set():
+            for folder, st in self._runs_status.items():
+                if st == "run":
+                    self._set_run_status(folder, self.tr_.t("runs_status_cancelled"))
+            QMessageBox.information(self, "CODYN", self.tr_.t("run_cancelled"))
+        elif ok:
+            QMessageBox.information(self, "CODYN", self.tr_.t("run_finished_ok"))
+        else:
+            QMessageBox.warning(self, "CODYN", self.tr_.t("run_finished_failed", n=len(failed)))
+
+    def cancel_all(self):
+        running = (self.worker is not None and self.worker.isRunning()) or \
+                  (self.mmpbsa_worker is not None and self.mmpbsa_worker.isRunning())
+        if not running:
+            self.tabs.setCurrentIndex(0)
+            return
+        ans = QMessageBox.question(self, self.tr_.t("msg_attention"), self.tr_.t("run_cancel_confirm"),
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans == QMessageBox.Yes:
+            self.token.cancel()
+            self.tabs.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------ utilitários ------------------------------------------------------------------
+    def show_requirements_installer(self):
+        self.req_win = RequirementsInstaller(None, self.tr_)
+        self.req_win.setWindowModality(Qt.ApplicationModal)
+        self.req_win.show()
+        self.req_win.raise_()
+        self.req_win.activateWindow()
+        self.req_win.destroyed.connect(lambda: self.home.refresh())
+
+    def open_hw_monitor_window(self):
+        script = os.path.join(self.codyn_dir, "BIN", "hw_monitor_window.py")
+        if not os.path.isfile(script):
+            QMessageBox.warning(self, "CODYN", self.tr_.t("msg_monitor_missing", path=script))
+            return
+        try:
+            subprocess.Popen([sys.executable, script])
+        except Exception as e:
+            QMessageBox.critical(self, "CODYN", f"{e}")
+
+    def open_terminal_window(self):
+        title = "CODYN - Terminal"
+        if _IS_WINDOWS:
+            # Windows: PowerShell numa janela de console própria acompanhando o log ao vivo (equivalente do
+            # `tail -F`). Fechar a janela não afeta o CODYN.
+            log_ps = CODYN_TERMINAL_LOG.replace("'", "''")
+            command = (f"$Host.UI.RawUI.WindowTitle = '{title}'; "
+                       f"Get-Content -LiteralPath '{log_ps}' -Wait -Encoding UTF8")
+            try:
+                subprocess.Popen(["powershell", "-NoLogo", "-NoProfile", "-NoExit", "-Command", command],
+                                 stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            except Exception:
+                QMessageBox.warning(self, "CODYN", self.tr_.t("msg_terminal_missing", path=CODYN_TERMINAL_LOG))
+            return
+        tail = ["tail", "-n", "+1", "-F", CODYN_TERMINAL_LOG]
+        candidates = [
+            ("gnome-terminal", [f"--title={title}", "--"] + tail),
+            ("x-terminal-emulator", ["-e", shlex.join(tail)]),
+            ("xfce4-terminal", ["-T", title, "-e", shlex.join(tail)]),
+            ("mate-terminal", ["-t", title, "-e", shlex.join(tail)]),
+            ("konsole", ["-e"] + tail),
+            ("xterm", ["-T", title, "-e"] + tail),
+        ]
+        for exe, args in candidates:
+            path = shutil.which(exe)
+            if path:
+                try:
+                    subprocess.Popen([path] + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+                    return
+                except Exception:
+                    continue
+        QMessageBox.warning(self, "CODYN", self.tr_.t("msg_terminal_missing", path=CODYN_TERMINAL_LOG))
+
+    def show_about(self):
+        QMessageBox.about(self, self.tr_.t("menu_about").replace("&", ""), self.tr_.t("about_text", versao=VERSAO))
+
+    def closeEvent(self, event):
+        busy = (self.worker is not None and self.worker.isRunning()) or \
+               (self.mmpbsa_worker is not None and self.mmpbsa_worker.isRunning())
+        if busy:
+            ans = QMessageBox.question(self, self.tr_.t("msg_attention"), self.tr_.t("run_close_confirm"),
+                                       QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.token.cancel()
+            for w in (self.worker, self.mmpbsa_worker):
+                if w is not None and w.isRunning():
+                    w.wait(8000)
+        event.accept()
+
+    # ------------------------------------------------------------------ verificações iniciais ------------------------------------------------------------------
+    def post_start_checks(self):
+        st = self.status
+        if self._migration:
+            path, moved, copied = self._migration
+            QMessageBox.information(self, "CODYN", self.tr_.t("msg_migrated", path=path, moved=moved, copied=copied))
+        if st.get("missing_folders"):
+            QMessageBox.warning(self, "CODYN", self.tr_.t("msg_missing_folders", folders=", ".join(st["missing_folders"]), url=GITHUB_URL))
+        problems = list(st.get("missing_tools", []))
+        problems += missing_required_python()
+        if problems:
+            box = QMessageBox(QMessageBox.Warning, "CODYN", self.tr_.t("msg_missing_requirements", items=", ".join(problems)),
+                              QMessageBox.NoButton, self)
+            b_inst = box.addButton(self.tr_.t("btn_open_installer"), QMessageBox.AcceptRole)
+            box.addButton(self.tr_.t("btn_close"), QMessageBox.RejectRole)
+            box.exec_()
+            if box.clickedButton() is b_inst:
+                self.show_requirements_installer()
+
+
+def main():
+    if _IS_WINDOWS:
+        # identidade própria na barra de tarefas (senão o Windows agrupa a janela sob o ícone do Python)
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MoisesMaia.CODYN")
+        except Exception:
+            pass
+    app = QApplication(sys.argv)
+    app.setApplicationName("CODYN")
+    app.setStyleSheet(SS_MAIN)
+    splash = SplashScreen(CODYN_DIR)
     splash.show()
     splash.start_checks()
+    holder = {}
 
     def start_mainwindow(status):
         splash.close()
-
-        # Pastas "críticas" → manter aviso + abrir GitHub
-        critical_set = {"BASE", "BIN", "ICONS", "TEST"}
-        # Pastas "auto-criáveis" → apenas criar e avisar (sem abrir GitHub)
-        autocreate_set = {"RUNS", "TARGET", "LIGANDS"}
-
-        missing = set(status.get("missing_folders", []))
-
-        if missing:
-            crit_missing = sorted([f for f in missing if f in critical_set])
-            auto_missing = sorted([f for f in missing if f in autocreate_set])
-
-            if crit_missing:
-                QMessageBox.warning(
-                    None,
-                    "Missing required folders",
-                    "The following mandatory folders were not found: "
-                    + ", ".join(crit_missing)
-                    + "\nPlease download the complete project structure from GitHub."
-                )
-                webbrowser.open("https://github.com/moimaian/CODYN")
-
-            if auto_missing:
-                # Cria as pastas diretamente no diretório do projeto
-                for name in auto_missing:
-                    os.makedirs(os.path.join(codyn_dir, name), exist_ok=True)
-                QMessageBox.information(
-                    None,
-                    "Folders created",
-                    "The following folders were created automatically: "
-                    + ", ".join(auto_missing)
-                )
-
-        window = MainWindow()
-        window.show()
-
-        # Alertas para comandos ausentes no PATH
-        missing_tools = [cmd for cmd, ok in status['env_cmds'].items() if not ok]
-        if missing_tools:
-            QMessageBox.critical(
-                window,
-                "Dependencies not installed",
-                "The following commands are not available in the PATH:\n"
-                + "\n".join(missing_tools) +
-                "\n\nPlease install the requirements. (Or use the button on the Home tab to install later.)"
-            )
+        win = MainWindow(status)
+        holder["win"] = win
+        win.show()
+        QTimer.singleShot(300, win.post_start_checks)
 
     splash.check_complete.connect(start_mainwindow)
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

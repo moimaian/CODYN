@@ -1,19 +1,22 @@
+import json
 import os
 import re
-import numpy as np
 import subprocess
 from datetime import datetime
+
+import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 import matplotlib.pyplot as plt
-from matplotlib import cm
-from mpl_toolkits.mplot3d import Axes3D 
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registra a projeção 3d)
+
+from BIN.tools import find_gmx
 
 class ViewWorker(QObject):
     log_view_signal = pyqtSignal(str)
 
-    def __init__(self, codyn_dir, run_folder, step, chart, group_index1=None, group_index2=None, use_moving_avg=False, moving_avg_value=20, use_legend=False):
+    def __init__(self, runs_dir, run_folder, step, chart, group_index1=None, group_index2=None, use_moving_avg=False, moving_avg_value=20, use_legend=False):
         super().__init__()
-        self.codyn_dir = codyn_dir
+        self.runs_dir = runs_dir
         self.run_folder = run_folder
         self.step = step
         self.chart = chart
@@ -22,6 +25,7 @@ class ViewWorker(QObject):
         self.use_moving_avg = use_moving_avg
         self.moving_avg_value = moving_avg_value
         self.use_legend = use_legend
+        self.gmx = find_gmx() or "gmx"
 
     def log(self, message: str):
         """Adiciona mensagem no status_prot com timestamp e faz auto-scroll."""
@@ -29,20 +33,23 @@ class ViewWorker(QObject):
         self.log_view_signal.emit(f"[{ts}] {message}")
 
     def plot_2D(self, file_name, x_label, y_label, legend_name, title, prot_name, lig_name):
-        xvg_path = os.path.join(self.codyn_dir, "RUNS", self.run_folder, f"{file_name}")
+        xvg_path = os.path.join(self.runs_dir, self.run_folder, f"{file_name}")
         if not os.path.exists(xvg_path):
             self.log(f"File {file_name} not found.")
             return
         x = []
         y = []
-        with open(xvg_path, "r") as f:
+        with open(xvg_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.startswith(("#", "@")):
                     continue
                 parts = line.split()
                 if len(parts) >= 2:
-                    x.append(float(parts[0]))
-                    y.append(float(parts[1]))
+                    try:
+                        x.append(float(parts[0]))
+                        y.append(float(parts[1]))
+                    except ValueError:
+                        continue
         if not x or not y:
             self.log(f"File {file_name} does not contain valid data.")
             return
@@ -76,7 +83,7 @@ class ViewWorker(QObject):
             return
 
         rows = []
-        with open(merge_path, "r") as f:
+        with open(merge_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.startswith(("#", "@")):
                     continue
@@ -117,12 +124,12 @@ class ViewWorker(QObject):
         self.log("Merged multiple Y vs X chart displayed successfully.")
 
     def plot_3D(self, file_name, title, prot_name, lig_name):
-        xvg_path = os.path.join(self.codyn_dir, "RUNS", self.run_folder, file_name)
+        xvg_path = os.path.join(self.runs_dir, self.run_folder, file_name)
         if not os.path.exists(xvg_path):
             self.log(f"File {file_name} not found.")
             return
         x, y, z = [], [], []
-        with open(xvg_path, "r") as f:
+        with open(xvg_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.startswith(("#", "@")):
                     continue
@@ -142,8 +149,9 @@ class ViewWorker(QObject):
         # Gradiente de cor dos marcadores: do amarelo claro ao laranja escuro
         n_points = len(x)
         # Interpolação entre amarelo claro (rgb: 1,1,0.5) e laranja escuro (rgb: 1,0.4,0)
+        denom = max(n_points - 1, 1)
         colors = [
-            (1, 1 - 0.6*i/(n_points-1), 0.5 - 0.5*i/(n_points-1))
+            (1, 1 - 0.6 * i / denom, 0.5 - 0.5 * i / denom)
             for i in range(n_points)
         ]
         ax.scatter(x, y, z, s=50, c=colors, marker="o")
@@ -158,184 +166,139 @@ class ViewWorker(QObject):
         plt.show()
         self.log("3D COM chart displayed successfully.")
         
-    def chart_post_production_rmsd(self, run_path, index1, index2, t_ns_md, prot_name, lig_name):
-        rmsd_xvg = f"rmsd_{prot_name}_{lig_name}_{index1}_{index2}.xvg"  
-        if not os.path.exists(f"{run_path}/{rmsd_xvg}"):     
-            cmd = f"gmx rms -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -o {rmsd_xvg} -tu ns"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n{index2}\n", text=True, capture_output=True)
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())
-            self.plot_2D(f"{rmsd_xvg}", "Time (ns)", "RMSD (nm)", f"RMSD_{index1}_{index2}", "RMSD Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {rmsd_xvg} already exists. Skipping RMSD calculation.")
-            self.plot_2D(f"{rmsd_xvg}", "Time (ns)", "RMSD (nm)", f"RMSD_{index1}_{index2}", "RMSD Analysis", prot_name, lig_name)            
+    # ------------------------------------------------------------------ análises (gmx) ------------------------------------------------------------------
+    def _analysis(self, run_path, out_files, args, group_inputs, label):
+        """Roda `gmx <args>` (se o .xvg principal ainda não existe) e registra a saída.
 
-    def chart_post_production_distrmsd(self, run_path, index1, t_ns_md, prot_name, lig_name):
-        distrmsd_xvg = f"distrmsd_{prot_name}_{lig_name}_{index1}.xvg"  
-        if not os.path.exists(f"{run_path}/{distrmsd_xvg}"):     
-            cmd = f"gmx rmsdist -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -o {distrmsd_xvg}"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n", text=True, capture_output=True)
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())                   
-            self.plot_2D(f"{distrmsd_xvg}", "Time (ps)", "RMSD (nm)", f"RMSD_{index1}", "RMSD Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {distrmsd_xvg} already exists. Skipping RMSDist calculation.")
-            self.plot_2D(f"{distrmsd_xvg}", "Time (ps)", "RMSD (nm)", f"RMSD_{index1}", "RMSD Dist. Analysis", prot_name, lig_name)
+        Devolve True se os arquivos estão disponíveis para plotar."""
+        main_out = os.path.join(run_path, out_files[0])
+        if os.path.exists(main_out):
+            self.log(f"File {out_files[0]} already exists. Skipping {label} calculation.")
+            return True
+        cmd = [self.gmx] + args
+        self.log("Command: " + " ".join(cmd))
+        try:
+            # entrada em bytes: em modo texto o Windows converteria "\n" em "\r\n" (o gmx leria "0\r")
+            res = subprocess.run(cmd, cwd=run_path, input="".join(f"{g}\n" for g in group_inputs).encode("utf-8"),
+                                 capture_output=True)
+            res.stdout = res.stdout.decode("utf-8", "replace")
+            res.stderr = res.stderr.decode("utf-8", "replace")
+        except OSError as e:
+            self.log(f"Error: could not run gmx ({e}).")
+            return False
+        if res.returncode != 0 or not os.path.exists(main_out):
+            msg = (res.stderr or res.stdout or "").strip().splitlines()
+            self.log(f"Error: gmx {args[0]} failed (exit code {res.returncode}).\n" + "\n".join(msg[-8:]))
+            return False
+        return True
 
-    def chart_post_production_rmsf(self, run_path, index1, t_ns_md, prot_name, lig_name):
-        rmsf_xvg = f"rmsf_{prot_name}_{lig_name}_{index1}.xvg"  
-        if not os.path.exists(f"{run_path}/{rmsf_xvg}"):     
-            cmd = f"gmx rmsf -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -o {rmsf_xvg} -res"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n", text=True, capture_output=True)
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())
-            self.plot_2D(f"{rmsf_xvg}", "Residue", "RMSF (nm)", f"RMSF_{index1}", "RMSF Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {rmsf_xvg} already exists. Skipping RMSF calculation.")
-            self.plot_2D(f"{rmsf_xvg}", "Residue", "RMSF (nm)", f"RMSF_{index1}", "RMSF Analysis", prot_name, lig_name)
-            
-    def chart_post_production_sasa(self, run_path, index1, t_ns_md, prot_name, lig_name):
-        sasa_xvg = f"sasa_{prot_name}_{lig_name}_{index1}.xvg"
-        sasa_atom_xvg = f"sasa_atom_{prot_name}_{lig_name}_{index1}.xvg"
-        sasa_res_xvg = f"sasa_res_{prot_name}_{lig_name}_{index1}.xvg"
-        if not os.path.exists(f"{run_path}/{sasa_xvg}"):     
-            cmd = f"gmx sasa -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -o {sasa_xvg} -oa {sasa_atom_xvg} -or {sasa_res_xvg} -tu ns"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n", text=True, capture_output=True)                    
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())
-            self.plot_2D(f"{sasa_xvg}", "Time (ns)", "Area (nm²)", f"SASA_{index1}", "SASA Analysis", prot_name, lig_name)
-            self.plot_2D(f"{sasa_res_xvg}", "Residue", "Area (nm²)", f"SASA_Res_{index1}", "SASA Residue Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {sasa_xvg} already exists. Skipping SASA calculation.")
-            self.plot_2D(f"{sasa_xvg}", "Time (ns)", "Area (nm²)", f"SASA_{index1}", "SASA Analysis", prot_name, lig_name)
-            self.plot_2D(f"{sasa_res_xvg}", "Residue", "Area (nm²)", f"SASA_Res_{index1}", "SASA Residue Analysis", prot_name, lig_name)
-            
-    def chart_post_production_hbonds(self, run_path, index1, index2, t_ns_md, prot_name, lig_name):
-        hbonds_xvg = f"hbonds_{prot_name}_{lig_name}_{index1}_{index2}.xvg"  
-        if not os.path.exists(f"{run_path}/{hbonds_xvg}"):     
-            cmd = f"gmx hbond -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -num {hbonds_xvg} -tu ns"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n{index2}\n", text=True, capture_output=True)
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())
-            self.plot_2D(f"{hbonds_xvg}", "Time (ns)", "Nº Hbonds", f"Hbonds_{index1}_{index2}", "Hbonds Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {hbonds_xvg} already exists. Skipping Hbonds calculation.")
-            self.plot_2D(f"{hbonds_xvg}", "Time (ns)", "Nº Hbonds", f"Hbonds_{index1}_{index2}", "Hbonds Analysis", prot_name, lig_name)
-    
-    def chart_post_production_com(self, run_path, index1, t_ns_md, prot_name, lig_name):
-        com_xvg = f"com_{prot_name}_{lig_name}_{index1}.xvg"  
-        if not os.path.exists(f"{run_path}/{com_xvg}"):     
-            cmd = f"gmx traj -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -com yes -ox {com_xvg} -x yes -y yes -z yes -nojump yes -tu ns"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n", text=True, capture_output=True)
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())
-            self.plot_3D(f"{com_xvg}", "Center Of Mass Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {com_xvg} already exists. Skipping Center Of Mass calculation.")
-            self.plot_3D(f"{com_xvg}", "Center Of Mass Analysis", prot_name, lig_name)
+    def _traj_args(self, t):
+        return ["-s", f"md_0_{t}.tpr", "-f", f"md_0_{t}_noPBC.xtc", "-n", "index.ndx"]
 
-    def chart_post_production_rgyration(self, run_path, index1, t_ns_md, prot_name, lig_name):
-        rgyr_xvg = f"rgyration_{prot_name}_{lig_name}_{index1}.xvg"  
-        if not os.path.exists(f"{run_path}/{rgyr_xvg}"):     
-            cmd = f"gmx gyrate -s md_0_{t_ns_md}.tpr -f md_0_{t_ns_md}_noPBC.xtc -n index.ndx -o {rgyr_xvg}"
-            self.log(f"\nCommand: {cmd}\n")
-            result=subprocess.run(cmd, shell=True, cwd=run_path, input=f"{index1}\n", text=True, capture_output=True)
-            if result.stdout:
-                self.log(result.stdout.strip())
-            if result.stderr:
-                self.log("Erro: " + result.stderr.strip())
-            self.plot_2D(f"{rgyr_xvg}", "Time (ps)", "Rg (nm)", f"Rgyration_{index1}", "Rgyration Analysis", prot_name, lig_name)
-        else:
-            self.log(f"File {rgyr_xvg} already exists. Skipping Rgyration calculation.")
-            self.plot_2D(f"{rgyr_xvg}", "Time (ps)", "Rg (nm)", f"Rgyration_{index1}", "Rgyration Analysis", prot_name, lig_name)
+    def chart_post_production_rmsd(self, run_path, index1, index2, t, prot_name, lig_name):
+        f = f"rmsd_{prot_name}_{lig_name}_{index1}_{index2}.xvg"
+        if self._analysis(run_path, [f], ["rms"] + self._traj_args(t) + ["-o", f, "-tu", "ns"], [index1, index2], "RMSD"):
+            self.plot_2D(f, "Time (ns)", "RMSD (nm)", f"RMSD_{index1}_{index2}", "RMSD Analysis", prot_name, lig_name)
+
+    def chart_post_production_distrmsd(self, run_path, index1, t, prot_name, lig_name):
+        f = f"distrmsd_{prot_name}_{lig_name}_{index1}.xvg"
+        if self._analysis(run_path, [f], ["rmsdist"] + self._traj_args(t) + ["-o", f], [index1], "RMSDist"):
+            self.plot_2D(f, "Time (ps)", "RMSD (nm)", f"RMSD_{index1}", "RMSD Dist. Analysis", prot_name, lig_name)
+
+    def chart_post_production_rmsf(self, run_path, index1, t, prot_name, lig_name):
+        f = f"rmsf_{prot_name}_{lig_name}_{index1}.xvg"
+        if self._analysis(run_path, [f], ["rmsf"] + self._traj_args(t) + ["-o", f, "-res"], [index1], "RMSF"):
+            self.plot_2D(f, "Residue", "RMSF (nm)", f"RMSF_{index1}", "RMSF Analysis", prot_name, lig_name)
+
+    def chart_post_production_sasa(self, run_path, index1, t, prot_name, lig_name):
+        f = f"sasa_{prot_name}_{lig_name}_{index1}.xvg"
+        f_atom = f"sasa_atom_{prot_name}_{lig_name}_{index1}.xvg"
+        f_res = f"sasa_res_{prot_name}_{lig_name}_{index1}.xvg"
+        if self._analysis(run_path, [f, f_atom, f_res],
+                          ["sasa"] + self._traj_args(t) + ["-o", f, "-oa", f_atom, "-or", f_res, "-tu", "ns"], [index1], "SASA"):
+            self.plot_2D(f, "Time (ns)", "Area (nm²)", f"SASA_{index1}", "SASA Analysis", prot_name, lig_name)
+            self.plot_2D(f_res, "Residue", "Area (nm²)", f"SASA_Res_{index1}", "SASA Residue Analysis", prot_name, lig_name)
+
+    def chart_post_production_hbonds(self, run_path, index1, index2, t, prot_name, lig_name):
+        f = f"hbonds_{prot_name}_{lig_name}_{index1}_{index2}.xvg"
+        if self._analysis(run_path, [f], ["hbond"] + self._traj_args(t) + ["-num", f, "-tu", "ns"], [index1, index2], "Hbonds"):
+            self.plot_2D(f, "Time (ns)", "Nº Hbonds", f"Hbonds_{index1}_{index2}", "Hbonds Analysis", prot_name, lig_name)
+
+    def chart_post_production_com(self, run_path, index1, t, prot_name, lig_name):
+        f = f"com_{prot_name}_{lig_name}_{index1}.xvg"
+        if self._analysis(run_path, [f], ["traj"] + self._traj_args(t) + ["-com", "yes", "-ox", f, "-x", "yes", "-y", "yes",
+                                                                           "-z", "yes", "-nojump", "yes", "-tu", "ns"], [index1], "Center of Mass"):
+            self.plot_3D(f, "Center Of Mass Analysis", prot_name, lig_name)
+
+    def chart_post_production_rgyration(self, run_path, index1, t, prot_name, lig_name):
+        f = f"rgyration_{prot_name}_{lig_name}_{index1}.xvg"
+        if self._analysis(run_path, [f], ["gyrate"] + self._traj_args(t) + ["-o", f], [index1], "Rgyration"):
+            self.plot_2D(f, "Time (ps)", "Rg (nm)", f"Rgyration_{index1}", "Rgyration Analysis", prot_name, lig_name)
+
+    # ------------------------------------------------------------------ execução ------------------------------------------------------------------
+    @staticmethod
+    def names_from_run(run_path, run_folder):
+        """(proteína, ligante): de run_config.json; para pastas antigas, do nome da pasta."""
+        try:
+            with open(os.path.join(run_path, "run_config.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("protein") and cfg.get("ligand"):
+                return cfg["protein"], cfg["ligand"]
+        except (OSError, ValueError):
+            pass
+        parts = run_folder.split("_")
+        return (parts[-2], parts[-1]) if len(parts) >= 4 else ("Unknown", "Unknown")
 
     def run(self):
-        parts = self.run_folder.split('_')
-        if len(parts) >= 4:
-            prot_name = parts[-2]
-            lig_name = parts[-1]
-        else:
-            prot_name = "Unknown"
-            lig_name = "Unknown"
-            
-        # Caminho da pasta
-        run_path = os.path.join(self.codyn_dir, "RUNS", self.run_folder)
+        run_path = os.path.join(self.runs_dir, self.run_folder)
+        if not os.path.isdir(run_path):
+            self.log(f"Run folder not found: {run_path}")
+            return
+        prot_name, lig_name = self.names_from_run(run_path, self.run_folder)
 
-        # Procura o arquivo .xtc que começa com md_0_ e termina com .xtc
-        xtc_file = None
-        for fname in os.listdir(run_path):
-            match = re.match(r"md_0_(\d+)\.xtc", fname)
-            if match:
-                t_ns_md = match.group(1)  # Valor do tempo de produção
-                xtc_file = fname
+        t_ns_md = "Unknown"
+        for fname in sorted(os.listdir(run_path)):
+            m = re.fullmatch(r"md_0_([0-9]+(?:\.[0-9]+)?)\.xtc", fname)
+            if m:
+                t_ns_md = m.group(1)
                 break
-        else:
-            t_ns_md = "Unknown"        
-       
+
         try:
             self.log(f"Starting analysis for Run Folder: {self.run_folder}")
-            # Exemplo de lógica para diferentes opções
             if self.step == "Pre-production":
-                if self.chart == "Potential Energy-Minimization":
-                    self.log(f"View potential energy minimization for {prot_name} and {lig_name}...")
-                    self.plot_2D("potential.xvg", "Time (ps)", "Energy (kJ/mol)", "Potential Energy",
-                                              f"Potential Energy Minimization", prot_name, lig_name)
-                elif self.chart == "Temperature-NVT":
-                    self.log(f"View temperature for {prot_name} and {lig_name} during NVT equilibration...")
-                    self.plot_2D("temperature.xvg", "Time (ps)", "Temperature (K)", "Temperature",
-                                              f"Temperature NVT", prot_name, lig_name)
-                elif self.chart == "Pressure-NPT":
-                    self.log(f"View pressure for {prot_name} and {lig_name} during NPT equilibration...")
-                    self.plot_2D("pressure.xvg", "Time (ps)", "Pressure (bar)", "Pressure",
-                                              f"Pressure NPT", prot_name, lig_name)
-                elif self.chart == "Density-NPT":
-                    self.log(f"View density for {prot_name} and {lig_name} during NPT equilibration...")
-                    self.plot_2D("density.xvg", "Time (ps)", "Density (g/cm³)", "Density",
-                                              f"Density NPT", prot_name, lig_name)
+                table = {
+                    "Potential Energy-Minimization": ("potential.xvg", "Time (ps)", "Energy (kJ/mol)", "Potential Energy", "Potential Energy Minimization"),
+                    "Temperature-NVT": ("temperature.xvg", "Time (ps)", "Temperature (K)", "Temperature", "Temperature NVT"),
+                    "Pressure-NPT": ("pressure.xvg", "Time (ps)", "Pressure (bar)", "Pressure", "Pressure NPT"),
+                    "Density-NPT": ("density.xvg", "Time (ps)", "Density (kg/m³)", "Density", "Density NPT"),
+                }
+                if self.chart in table:
+                    f, xl, yl, leg, title = table[self.chart]
+                    self.log(f"View {leg.lower()} for {prot_name} and {lig_name}...")
+                    self.plot_2D(f, xl, yl, leg, title, prot_name, lig_name)
                 else:
                     self.log(f"Analysis for {self.chart} not implemented.")
             elif self.step == "Post-production":
+                if t_ns_md == "Unknown":
+                    self.log("Production trajectory (md_0_*_noPBC.xtc) not found in this run folder.")
+                    return
+                g1, g2 = self.group_index1, self.group_index2
+                self.log(f"Starting {self.chart} analysis for {prot_name} and {lig_name} ({t_ns_md} ns)...")
                 if self.chart == "RMSD":
-                    self.log(f"Starting RMSD analysis for {prot_name} and {lig_name} in {t_ns_md} ns...")
-                    self.chart_post_production_rmsd(run_path, self.group_index1, self.group_index2, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_rmsd(run_path, g1, g2, t_ns_md, prot_name, lig_name)
                 elif self.chart == "RMSD Dist":
-                    self.log(f"Starting RMSD Dist analysis for {prot_name} and {lig_name} in {t_ns_md} ns...")
-                    self.chart_post_production_distrmsd(run_path, self.group_index1, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_distrmsd(run_path, g1, t_ns_md, prot_name, lig_name)
                 elif self.chart == "RMSF":
-                    self.log(f"RMSF analysis for {prot_name} and {lig_name} not implemented yet.")
-                    self.chart_post_production_rmsf(run_path, self.group_index1, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_rmsf(run_path, g1, t_ns_md, prot_name, lig_name)
                 elif self.chart == "SASA":
-                    self.log(f"SASA analysis for {prot_name} and {lig_name} not implemented yet.")
-                    self.chart_post_production_sasa(run_path, self.group_index1, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_sasa(run_path, g1, t_ns_md, prot_name, lig_name)
                 elif self.chart == "HBONDs":
-                    self.log(f"HBONDs analysis for {prot_name} and {lig_name} not implemented yet.")
-                    self.chart_post_production_hbonds(run_path, self.group_index1, self.group_index2, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_hbonds(run_path, g1, g2, t_ns_md, prot_name, lig_name)
                 elif self.chart == "Center Of Mass":
-                    self.log(f"Center of Mass analysis for {prot_name} and {lig_name} not implemented yet.")
-                    self.chart_post_production_com(run_path, self.group_index1, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_com(run_path, g1, t_ns_md, prot_name, lig_name)
                 elif self.chart == "Rgyration":
-                    self.log(f"Rgyration analysis for {prot_name} and {lig_name} not implemented yet.")
-                    self.chart_post_production_rgyration(run_path, self.group_index1, t_ns_md, prot_name, lig_name)
+                    self.chart_post_production_rgyration(run_path, g1, t_ns_md, prot_name, lig_name)
                 else:
                     self.log(f"Option {self.chart} not yet implemented!")
-
         except Exception as e:
-            self.log(f"Error: {str(e)}")
+            self.log(f"Error: {type(e).__name__}: {e}")

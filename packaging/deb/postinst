@@ -1,0 +1,19 @@
+#!/bin/sh
+# postinst do pacote codyn
+#
+# Propositalmente NÃO cria $HOME/CODYN nem $HOME/.venv/CODYN aqui: este
+# script roda como root durante "apt install"/"dpkg -i", momento em que
+# $HOME/SUDO_USER não identificam de forma confiável o usuário final. Esse
+# trabalho por-usuário é feito pelo CODYN.py na primeira execução.
+
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -d /usr/share/icons/hicolor ]; then
+    gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+fi
+
+exit 0

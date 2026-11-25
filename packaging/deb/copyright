@@ -1,0 +1,40 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: CODYN
+Upstream-Contact: Moisés Maia Neto <moimaian@gmail.com>
+Source: https://github.com/moimaian/CODYN
+
+Files: *
+Copyright: 2025-2026 Moisés Maia
+License: GPL-3+
+
+Files: BASE/charmm36-jul2021.ff/*
+Copyright: MacKerell Lab, University of Maryland (CHARMM36 force field,
+ GROMACS port by the MacKerell Lab)
+License: free-for-academic
+Comment: Campo de força CHARMM36 (jul/2021) para GROMACS, redistribuído sem
+ alterações. Consulte http://mackerell.umaryland.edu/charmm_ff.shtml para as
+ condições de uso.
+
+Files: BASE/cgenff_charmm2gmx_py3_nx2.py
+Copyright: Justin A. Lemkul and the CGenFF/MacKerell Lab authors
+License: free-for-academic
+Comment: Conversor CGenFF (.str) -> GROMACS, de
+ https://gitlab.com/Lemkul-Lab/cgenff_charmm2gmx .
+
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public
+ License version 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: free-for-academic
+ Redistributed unmodified for academic use; see the Comment field above and
+ the upstream site for the exact terms.

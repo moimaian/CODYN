@@ -1,0 +1,10 @@
+# Instalado em /usr/share/lintian/overrides/codyn pelo build.sh.
+# Avisos que valem para o repositório oficial do Debian, mas não para o CODYN,
+# distribuído como pacote de terceiros (ver packaging/deb/README.md).
+
+# /opt é o lugar previsto pela FHS para software de terceiros (o launcher
+# /usr/bin/codyn sincroniza /opt/codyn -> $HOME/CODYN).
+codyn: dir-or-file-in-opt
+
+# Aplicação gráfica, aberta pelo menu; não há CLI a documentar em man page.
+codyn: no-manual-page

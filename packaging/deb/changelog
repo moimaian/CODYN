@@ -1,0 +1,59 @@
+codyn (2.2.0-1) unstable; urgency=low
+
+  * Aba RESULTS reorganizada: "Seleção" e "Opções do gráfico" lado a lado
+    (opções empilhadas, com os botões LIMPAR e VISUALIZAR).
+  * Novo botão "Gerar Relatório Final": gera o .docx do projeto em
+    PROJECTS/<projeto>/RESULTS/ com introdução (descoberta de fármacos, CADD,
+    dinâmica molecular), configurações, método de cada etapa, gráficos
+    (equilibração, RMSD, RMSF, Rg, SASA, ligações de hidrogênio, distância,
+    MM/GBSA e decomposição por resíduo) e discussão automática, em PT ou EN.
+  * python-docx passa a ser instalável pelo instalador de requisitos.
+  * Aba STEP 6 com os parâmetros em 3 colunas; grupo "Projetos" na aba CONFIG
+    ocupa metade da largura.
+  * Novo manual do usuário em português e inglês (TUTORIALS/*.docx e .pdf),
+    com o gerador e as capturas de tela em TUTORIALS/source/ (fora do .deb).
+  * Compatibilidade com Windows 10/11 e Python 3.10.11 (BIN/platform_utils.py,
+    BIN/module_requirements.py, BIN/tools.py, BIN/splash_screen.py, CODYN.py,
+    CODYN_Windows.bat, ICONS/CODYN.ico): o bootstrap detecta o sistema; no
+    Windows o venv usa o Python 3.10.11 (achado, ou instalado por winget ou
+    pelo instalador do python.org) em .venv\CODYN\Scripts\python.exe, que
+    passa a ser o python de todos os comandos de instalação. Instala o runtime
+    Visual C++ do Qt5, Perl (winget), Open Babel (pip) e compila o GROMACS
+    (CMake + Visual Studio Build Tools); cria os atalhos CODYN.lnk. Processos
+    filhos sem janela de console e com cancelamento da árvore de processos
+    (taskkill), log de sessão e Help > Terminal sem tee/tail/os.kill, arquivos
+    gravados com fim de linha LF. AMBER/GAFF e STEP 6 (MM/GBSA) dependem do
+    AmberTools e ficam só no Linux. Linux sem mudança de comportamento.
+  * Título da janela, README e descrição do pacote: "Plataforma Computacional
+    de Dinâmica Molecular". Aba CONFIG com os grupos em duas colunas sem
+    folgas entre eles; aba RESULTS com a lista do merge ao lado dos checkboxes.
+  * Correções: o texto das abas deixa de ser cortado em português ("RESULTADOS");
+    caracteres como ">" apareciam como "&gt;" no console das etapas; o relatório
+    não mostra mais "-0.00" nos componentes de energia.
+
+ -- Moisés Maia <moimaian@gmail.com>  Mon, 16 Nov 2026 20:00:00 -0300
+
+codyn (2.1.0-1) unstable; urgency=low
+
+  * Projetos (formato do CODEEP): novo grupo "Projects" na aba CONFIG para
+    criar/carregar PROJECTS/<AAAA-MM-DD_HH-MM>_<nome>/ com LIGANDS, TARGET e
+    RUNS. As execuções, o MM/PBSA e os resultados passam a usar o projeto
+    aberto; cada projeto lembra os parâmetros da sua última execução.
+  * Migração automática: a antiga pasta RUNS/ é movida para
+    PROJECTS/<data>_RUNS_ANTERIORES/RUNS/ (LIGANDS/ e TARGET/ antigos são
+    copiados, os originais são mantidos).
+  * Aba CONFIG com os grupos em duas colunas; HOME sem rolagem (janela se
+    ajusta ao conteúdo) e com separadores em relevo; "Sobre" na barra de menu.
+
+ -- Moisés Maia <moimaian@gmail.com>  Mon, 16 Nov 2026 18:00:00 -0300
+
+codyn (2.0.0-1) unstable; urgency=low
+
+  * Modernização completa do CODYN seguindo a arquitetura do CODRUG:
+    versionamento único (BIN/versao.py), empacotamento .deb, instalador de
+    requisitos com detecção de hardware, splash com atalho de menu
+    automático, HOME com hardware/software/pipeline, interface com grupos
+    recolhíveis e paleta unificada, tradução EN/PT em tempo real.
+  * Correções de bugs no pipeline (ver README.md, seção "Correções").
+
+ -- Moisés Maia <moimaian@gmail.com>  Mon, 16 Nov 2026 12:00:00 -0300

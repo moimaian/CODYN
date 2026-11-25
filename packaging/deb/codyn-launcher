@@ -1,0 +1,57 @@
+#!/bin/bash
+# /usr/bin/codyn — instalado pelo pacote .deb.
+#
+# Roda como o usuário comum que clicou no menu (não como root). Só faz duas
+# coisas:
+#   1) sincroniza o código instalado em /opt/codyn para $HOME/CODYN, sem
+#      nunca tocar nos dados do usuário (PROJECTS, RUNS, LIGANDS, TARGET, DADOS);
+#   2) delega o resto — venv em $HOME/.venv/CODYN, dependências, atalho em
+#      ~/.local/share/applications — ao próprio CODYN.py (ver
+#      BIN/module_requirements.py e BIN/splash_screen.py).
+set -euo pipefail
+
+SRC_DIR="/opt/codyn"
+APP_DIR="${HOME}/CODYN"
+
+if [ ! -d "$SRC_DIR" ]; then
+    echo "codyn: $SRC_DIR não encontrado — o pacote está corrompido ou foi removido." >&2
+    exit 1
+fi
+
+mkdir -p "$APP_DIR"
+
+if command -v rsync >/dev/null 2>&1; then
+    rsync -a \
+        --exclude='PROJECTS/' \
+        --exclude='RUNS/' \
+        --exclude='DADOS/' \
+        --exclude='LIGANDS/' \
+        --exclude='TARGET/' \
+        --exclude='.form_data.json' \
+        --exclude='__pycache__/' \
+        --exclude='*.pyc' \
+        "$SRC_DIR"/ "$APP_DIR"/
+else
+    for item in "$SRC_DIR"/*; do
+        name="$(basename "$item")"
+        case "$name" in PROJECTS|RUNS|DADOS|LIGANDS|TARGET) continue ;; esac
+        cp -rf "$item" "$APP_DIR"/
+    done
+fi
+
+# Só a PRIMEIRA execução (que ainda cria o venv e pode pedir confirmações/senha)
+# é reaberta dentro de um emulador de terminal.
+VENV_PY="${HOME}/.venv/CODYN/bin/python"
+if [ ! -x "$VENV_PY" ] && [ ! -t 0 ] && [ -z "${CODYN_SETUP_TERMINAL:-}" ]; then
+    export CODYN_SETUP_TERMINAL=1
+    SELF="$(readlink -f "$0")"
+    if command -v gnome-terminal >/dev/null 2>&1; then
+        exec gnome-terminal --title="CODYN - Setup" -- "$SELF" "$@"
+    elif command -v x-terminal-emulator >/dev/null 2>&1; then
+        exec x-terminal-emulator -e "$SELF"
+    elif command -v xterm >/dev/null 2>&1; then
+        exec xterm -T "CODYN - Setup" -e "$SELF" "$@"
+    fi
+fi
+
+exec python3 "$APP_DIR/CODYN.py" "$@"

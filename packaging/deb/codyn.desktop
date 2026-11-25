@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CODYN
+Comment=Computational platform for protein-ligand molecular dynamics (GROMACS)
+Comment[pt_BR]=Dinâmica molecular automatizada proteína-ligante (GROMACS)
+Exec=/usr/bin/codyn
+Icon=/opt/codyn/ICONS/LOGO_CODYN.png
+Terminal=false
+Categories=Science;Chemistry;Qt;
+StartupNotify=false

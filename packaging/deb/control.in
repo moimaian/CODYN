@@ -1,0 +1,25 @@
+Package: codyn
+Version: @VERSION@
+Section: science
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.10), python3-venv, python3-pip
+Recommends: python3.10, rsync, perl
+Suggests: gromacs, openbabel
+Maintainer: Moisés Maia <moimaian@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/moimaian/CODYN
+Description: Computational platform for protein-ligand molecular dynamics (GROMACS)
+ CODYN is a PyQt5-based graphical tool that automates protein-multiligand
+ molecular dynamics with GROMACS: ligand parametrization (CHARMM36/CGenFF
+ or AMBER/GAFF), complex assembly, solvation and ionization, energy
+ minimization, NVT/NPT equilibration, production runs, MM/PBSA and MM/GBSA
+ with gmx_MMPBSA, and trajectory analysis (RMSD, RMSF, SASA, H-bonds,
+ radius of gyration).
+ .
+ This package installs the application files to /opt/codyn and a menu
+ launcher. On first run, CODYN itself creates an isolated Python virtual
+ environment at ~/.venv/CODYN. GROMACS, CUDA and gmx_MMPBSA are installed on
+ demand from the "Install requirements" window — this package does not
+ install them as root during installation, by design (see
+ packaging/deb/README.md).

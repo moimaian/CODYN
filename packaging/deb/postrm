@@ -1,0 +1,23 @@
+#!/bin/sh
+# postrm do pacote codyn
+#
+# Nunca apaga nada em $HOME: ~/CODYN/RUNS guarda resultados do usuário e
+# ~/.venv/CODYN é um ambiente por-usuário. Só avisamos.
+
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+if [ "$1" = "purge" ]; then
+    cat <<'MSG' >&2
+codyn: o pacote foi removido, mas dados por-usuário NÃO foram apagados:
+  - Código copiado/resultados:  ~/CODYN  (inclui ~/CODYN/RUNS)
+  - Ambiente virtual Python:    ~/.venv/CODYN
+Remova manualmente esses diretórios, para cada usuário que os tenha, se
+quiser liberar o espaço.
+MSG
+fi
+
+exit 0
